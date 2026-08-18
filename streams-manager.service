@@ -1,0 +1,40 @@
+[Unit]
+Description=Streams Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=streams
+Group=streams
+WorkingDirectory=/opt/streams-manager
+Environment=STREAMS_MANAGER_CONFIG=/var/lib/streams-manager/config.json
+Environment=STREAMS_MANAGER_HOST=0.0.0.0
+Environment=STREAMS_MANAGER_PORT=8409
+# Generate one with: openssl rand -hex 24
+Environment=STREAMS_MANAGER_TOKEN=CHANGE-ME
+# Uncomment to require the token on /stream and /playlist.m3u8 as well.
+#Environment=STREAMS_MANAGER_PROTECT_STREAMS=1
+ExecStart=/opt/streams-manager/.venv/bin/python run.py
+
+Restart=on-failure
+RestartSec=5
+
+# Source commands are children of this unit; kill the whole tree on stop.
+KillMode=control-group
+TimeoutStopSec=20
+
+# The service executes operator-supplied commands by design, so give it as
+# little of the host as it can get away with.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/streams-manager
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target
