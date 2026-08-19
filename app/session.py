@@ -39,6 +39,12 @@ READ_CHUNK = 64 * 1024
 # backoff from scratch instead of inheriting the previous ladder.
 HEALTHY_RUN_SECONDS = 60.0
 
+# A source that streamed for at least this long and then ended is treated as
+# reconnecting rather than failing. Live HLS sources routinely end when a token
+# or playlist window rotates, and hammering them as though they had crashed is
+# what turns a brief rotation into a visible outage.
+RECONNECT_MIN_SECONDS = 15.0
+
 TS_PACKET = 188
 TS_SYNC = 0x47
 # Give up on finding TS sync after this much data and pass bytes through raw,
@@ -258,7 +264,9 @@ class Broadcaster:
 
         self.status = "starting"
         self.last_error = ""
+        self.last_end = ""         # why the last attempt ended, error or not
         self.restarts = 0
+        self.reconnects = 0        # clean re-opens after a good run
         self.failures = 0          # consecutive failed attempts
         self.bytes_out = 0
         self.started_at: Optional[float] = None
@@ -313,25 +321,36 @@ class Broadcaster:
             self.flowing_since = None
             attempt_started = time.monotonic()
             fatal = False
+            failure: Optional[StreamFailure] = None
+            reconnecting = False
             try:
                 self.started_at = attempt_started
                 await self._attempt()
-                raise StreamFailure("stream ended")
+                failure = StreamFailure("stream ended")
             except asyncio.CancelledError:
                 raise
             except StreamFailure as exc:
                 fatal = exc.fatal
-                self._fail(exc)
+                failure = exc
             except Exception as exc:  # noqa: BLE001 - surfaced to the GUI
-                self._fail(StreamFailure(str(exc)))
+                failure = StreamFailure(str(exc))
             finally:
+                ran_for = time.monotonic() - attempt_started
+                # Ending after a decent run is a reconnect, not a fault: the
+                # source worked, the upstream just closed the window.
+                reconnecting = (
+                    failure is not None
+                    and not fatal
+                    and self.flowing_since is not None
+                    and ran_for >= RECONNECT_MIN_SECONDS
+                )
+                if failure is not None:
+                    self._record_end(failure, reconnecting)
                 await self._cleanup()
 
-            ran_for = time.monotonic() - attempt_started
-            if ran_for >= HEALTHY_RUN_SECONDS:
+            if reconnecting or ran_for >= HEALTHY_RUN_SECONDS:
                 # It worked for a while, so this is a fresh problem.
                 backoff = self.settings.restart_backoff_seconds
-                self.failures = 1
                 self._on_healthy_run()
 
             if self._stopping or not self._has_consumers():
@@ -339,6 +358,18 @@ class Broadcaster:
             if fatal:
                 self._log("--- not retrying: the command or arguments cannot work ---")
                 break
+
+            if reconnecting:
+                # Give the upstream a moment to be ready again. Reopening
+                # instantly is what produces a burst of connection resets.
+                self.status = "restarting"
+                self.restarts += 1
+                if self.ledger is not None:
+                    self.ledger.restarts += 1
+                delay = self.settings.reconnect_delay_seconds
+                self._log(f"--- reopening in {delay:.0f}s ---")
+                await asyncio.sleep(delay)
+                continue
 
             if self._retry_immediately():
                 # Another candidate is waiting; failing over should not make the
@@ -381,7 +412,20 @@ class Broadcaster:
     def _on_finished(self) -> None:
         """Called when the session will not try again without being restarted."""
 
-    def _fail(self, exc: StreamFailure) -> None:
+    def _record_end(self, exc: StreamFailure, reconnecting: bool) -> None:
+        self.last_end = str(exc)
+        if reconnecting:
+            # Not an error, so it neither climbs the backoff ladder nor counts
+            # towards give-up, and it does not shout in the log every rotation.
+            self.reconnects += 1
+            self.failures = 0
+            self.last_error = ""
+            self.status = "restarting"
+            if self.ledger is not None:
+                self.ledger.reconnects += 1
+            log.info("session %s reopening: %s", self.key, exc)
+            self._log(f"--- {exc}; reopening ---")
+            return
         self.failures += 1
         self.last_error = str(exc)
         self.status = "error"
@@ -658,6 +702,8 @@ class Broadcaster:
             started_at=self.started_at,
             uptime_seconds=(now - self.flowing_since) if self.flowing_since else 0.0,
             restarts=self.restarts,
+            reconnects=self.reconnects,
+            last_end=self.last_end,
             dropped_chunks=sum(s.dropped for s in self._subscribers),
             input_dropped=0,
             ts_packets=c.packets,
@@ -714,8 +760,19 @@ class SourceSession(Broadcaster):
         return None
 
     def _untried_available(self) -> bool:
+        """Is there a *different* source worth trying right now?
+
+        The active source is excluded explicitly. A good run clears the tried
+        set so the highest-priority source gets another go, and without this
+        guard that made the source which just ended look untried - so it was
+        reopened with no delay at all, hammering an upstream that had only just
+        closed the connection.
+        """
+        current = self.active_source.id if self.active_source else None
         return any(
-            s.id not in self._tried and self.registry.has_room(s.network, self.key)
+            s.id not in self._tried
+            and s.id != current
+            and self.registry.has_room(s.network, self.key)
             for s in self.channel.ordered_sources()
         )
 

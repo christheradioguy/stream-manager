@@ -55,6 +55,8 @@ concurrent streams and refuse the second one.
   tail of the command's stderr, all in the GUI.
 - **Source tester** — run a command for a few seconds and see ffprobe's verdict
   before you save it.
+- **Bulk audit** — verify every source in one pass, from the GUI or the command
+  line, without exceeding your providers' connection limits.
 
 ## Install
 
@@ -162,6 +164,33 @@ upstream allows.
 
 The Networks tab shows live usage per pool, so you can see at a glance whether
 you are at your provider's ceiling.
+
+### Sources that rotate
+
+A live HLS source — especially one behind a proxy, a token or Cloudflare Access —
+often ends cleanly every few minutes when its playlist window or token rotates.
+The stream did not fail; the upstream simply closed it.
+
+This is handled as a **reopen** rather than a failure: it does not climb the
+backoff ladder, does not count towards *give up after N failures*, does not mark
+the session in error, and waits **Reopen delay** (3s by default) before
+reconnecting so the upstream has a moment to be ready. The session row shows a
+**Reopens** count separately from restarts, and `streams_manager_reconnects_total`
+tracks it in Prometheus.
+
+Viewers stay connected throughout — they see a short stall, not a disconnect.
+
+Better still, let the source tool ride out the rotation itself so no reopen is
+needed at all. For streamlink:
+
+```bash
+streamlink --stdout --retry-streams 5 --retry-open 10 --retry-max 0 \
+           --stream-timeout 120 'https://…' best
+```
+
+`--retry-open`/`--retry-streams` make streamlink reconnect internally instead of
+exiting, which is invisible to viewers. The ffmpeg equivalent is
+`-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 30`.
 
 Note that `-re` is only for file/lavfi inputs. Live sources are already paced by
 the sender, and adding `-re` will make the stream drift behind.
@@ -352,10 +381,62 @@ lag badly.
 | **Client queue** | 64 KB chunks buffered per viewer. A client that can't keep up drops data rather than stalling everyone else on the same source. |
 | **Startup timeout** | How long a newly started source may take to produce its first byte. Separate from the stall timeout, because connecting and authenticating is much slower than staying connected. Raise it for slow providers. |
 | **Stall timeout** | Restarts a source that stops producing data mid-stream. |
+| **Reopen delay** | Pause before reopening a source that ended *after streaming normally* — a live HLS token or playlist window rotating, say. Separate from the failure backoff because this is expected, not a fault. Raise it when reopening produces connection resets. |
 | **First / max retry delay** | Backoff ladder for failed attempts. It doubles per consecutive failure and resets once a run survives a minute. |
 | **Give up after N failures** | Stop retrying a source that keeps failing. 0 keeps trying forever. A transcode profile that dies without ever emitting a frame is treated as broken and abandoned after three tries regardless. |
 | **Terminate grace** | How long a process gets to exit on SIGTERM before it is killed. Raise it if you see `ignored SIGTERM, killing` in the log. |
 | **Default max clients** | Viewer cap per channel, counted across all profiles. 0 = unlimited. |
+
+## Auditing every source
+
+Checking that all your sources still work, the way you would loop over
+Tvheadend's services. Available from the **Audit** tab, the API, or a script:
+
+```bash
+tools/audit.py                                # everything
+tools/audit.py --failed-only                  # just the broken ones
+tools/audit.py --channel bbc1 --duration 15   # one channel, tested for longer
+tools/audit.py --json > audit.json            # for scripting
+tools/audit.py --results                      # reprint the last run
+```
+
+```
+      CHANNEL         SOURCE          VIDEO                     RATE  DETAIL
+PASS     1 BBC One    HD              h264 1280x720 25fps    7.7Mb/s  aac 1ch 44100Hz
+PASS     1 BBC One    SD backup       h264 720x576 25fps     3.2Mb/s
+PASS     3 ITV        Main            h264 1280x720 25fps    7.7Mb/s  aac 1ch 44100Hz
+FAIL     3 ITV        Dead link                                    -  no data produced (exit code 145)
+FAIL     4 Channel 4  Missing binary                               -  command not found: streamlink
+
+3 ok, 2 failed, 0 skipped, in 11s
+```
+
+The script is standard library only, so it needs no virtualenv, and it takes
+`--url` / `--token` (or `STREAMS_MANAGER_URL` / `STREAMS_MANAGER_TOKEN`). It
+exits **0** when everything passed, **1** when anything failed and **2** on a
+usage or connection error, so it drops straight into cron:
+
+```cron
+0 5 * * *  /opt/streams-manager/tools/audit.py --failed-only || mail -s "Dead TV sources" me@example.com
+```
+
+Each source is run for a few seconds and the output is probed, so a pass means
+bytes actually arrived **and** ffprobe found a playable stream in them — a source
+that emits data but nothing decodable is reported as a failure, not a pass.
+
+**Network limits are honoured.** An audit takes slots from the same pool the live
+streams use, so a provider capped at two concurrent streams is still only asked
+for two at a time and the rest queue. That is also why an audit can take a while
+with tight caps; it is doing that deliberately rather than getting your account
+throttled. Live viewers keep priority — the audit waits for a slot rather than
+taking one.
+
+Results feed Prometheus as `streams_manager_source_ok{channel,source}`, so a
+nightly audit can drive an alert:
+
+```promql
+streams_manager_source_ok == 0
+```
 
 ## Stream health
 
@@ -443,6 +524,9 @@ GET    /playlist.m3u8[?profile=&group=]
 GET    /stream/{id}[?profile=]
 GET    /xmltv.xml                       the merged guide (also /epg.xml)
 GET    /metrics                         Prometheus exposition
+GET    /api/audit                       last audit results and progress
+POST   /api/audit[?duration=&concurrency=&channel=&include_disabled=]
+POST   /api/audit/stop
 GET    /healthz
 
 GET    /api/state                       everything at once
@@ -540,6 +624,8 @@ transcoder ended (exit code 8): Error opening output files: Encoder not found
 | `encoder behind: N dropped` | The transcode can't run in real time on this CPU. Faster preset, lower resolution, or hardware encoding. |
 | Rising continuity errors | Packet loss upstream. Check the network path to the provider; the worst-PID hint in the session row narrows it to video or audio. |
 | Rising transport errors | The source itself is marking packets corrupt — a bad tuner, aerial or upstream link, not something this server can fix. |
+| A source drops every few minutes and reconnects | Normal for live HLS behind a proxy or token: the window rotates and the source exits cleanly. See **Sources that rotate** below. |
+| `Connection reset by peer` right after a reopen | The upstream had not finished recycling. Raise **Reopen delay**, and prefer letting the source tool retry internally. |
 | Stream plays then dies after ~30s | Source stopped producing. Check the log; if the source is just slow, raise **Stall timeout**. |
 | `503 every source is blocked` | The channel's networks are at capacity or disabled. Check the Networks tab; raise the cap, or give the channel a source on another network. |
 | Client shows no guide | The tvg-id in the playlist must match a `<channel id>` in the XMLTV. Check the EPG tab's mapping table — anything showing **no guide** has no match. |

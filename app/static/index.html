@@ -15,6 +15,7 @@
     <button data-view="channels" class="active">Channels</button>
     <button data-view="networks">Networks</button>
     <button data-view="epg">EPG</button>
+    <button data-view="audit">Audit</button>
     <button data-view="profiles">Profiles</button>
     <button data-view="settings">Settings</button>
   </nav>
@@ -192,6 +193,48 @@
     </div>
   </section>
 
+  <!-- ================= AUDIT ================= -->
+  <section class="view" id="view-audit">
+    <div class="panel">
+      <h2>Source audit
+        <div class="spacer"></div>
+        <label style="margin:0" class="sub">Seconds each</label>
+        <input type="number" id="audit-duration" value="8" min="2" max="60" step="1" style="width:70px">
+        <label style="margin:0" class="sub">At once</label>
+        <input type="number" id="audit-concurrency" value="3" min="1" max="16" step="1" style="width:60px">
+        <button class="small" id="audit-stop" hidden>Stop</button>
+        <button class="primary small" id="audit-start">Run audit</button>
+      </h2>
+      <div class="panel-body">
+        <div id="audit-progress" class="hint">
+          Runs every enabled source for a few seconds and reports what came out.
+          Network limits are honoured, so a provider capped at two streams is
+          still only asked for two at a time &mdash; the rest wait their turn.
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th style="width:1%"></th>
+            <th>Channel</th>
+            <th>Source</th>
+            <th>Network</th>
+            <th>Video</th>
+            <th>Audio</th>
+            <th class="num">Rate</th>
+            <th>Detail</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="audit-rows"></tbody>
+      </table>
+      <div class="empty" id="audit-empty">
+        No audit run yet. Also available from the command line:
+        <code>tools/audit.py --failed-only</code>
+      </div>
+    </div>
+  </section>
+
   <!-- ================= PROFILES ================= -->
   <section class="view" id="view-profiles">
     <div class="panel">
@@ -258,6 +301,13 @@
               <label for="s-stall">Stall timeout (s)</label>
               <input type="number" id="s-stall" name="stall_timeout_seconds" step="1" min="5" max="600">
               <div class="hint">Restart a source that stops producing data mid-stream.</div>
+            </div>
+            <div class="field">
+              <label for="s-reconnect">Reopen delay (s)</label>
+              <input type="number" id="s-reconnect" name="reconnect_delay_seconds" step="1" min="0" max="120">
+              <div class="hint">Pause before reopening a source that ended after streaming
+                normally, e.g. an HLS window rotating. Raise it if reopening produces
+                connection resets.</div>
             </div>
             <div class="field">
               <label for="s-backoff0">First retry delay (s)</label>
@@ -363,7 +413,7 @@
             <th>Session</th><th>Kind</th><th>Status</th><th class="num">Clients</th>
             <th class="num">Bitrate</th><th class="num">Data</th>
             <th class="num">TS errors</th>
-            <th class="num">Restarts</th><th class="num">Dropped</th><th>PIDs</th><th></th>
+            <th class="num">Restarts</th><th class="num">Reopens</th><th class="num">Dropped</th><th>PIDs</th><th></th>
           </tr>
         </thead>
         <tbody id="session-rows"></tbody>

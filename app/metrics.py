@@ -55,7 +55,11 @@ class _Writer:
 
 
 def render(
-    store: ConfigStore, manager: SessionManager, epg: EpgStore, version: str
+    store: ConfigStore,
+    manager: SessionManager,
+    epg: EpgStore,
+    version: str,
+    auditor=None,
 ) -> str:
     w = _Writer()
     now = time.time()
@@ -130,6 +134,10 @@ def render(
                  help_text="Times a source process was started.")
         w.metric("streams_manager_restarts_total", entry.restarts, labels, kind="counter",
                  help_text="Pipeline restarts, including source failovers.")
+        w.metric(
+            "streams_manager_reconnects_total", entry.reconnects, labels, kind="counter",
+            help_text="Clean re-opens after a source streamed normally then ended.",
+        )
         w.metric("streams_manager_ts_packets_total", entry.ts.packets, labels, kind="counter",
                  help_text="MPEG-TS packets relayed.")
         w.metric(
@@ -192,6 +200,33 @@ def render(
             labels,
             help_text="Seconds since an EPG source last refreshed.",
         )
+
+    # -- last audit ----------------------------------------------------------
+    if auditor is not None and auditor.results:
+        state = auditor.state()
+        for status in ("ok", "failed", "skipped"):
+            w.metric(
+                "streams_manager_audit_sources", state["counts"].get(status, 0),
+                [("result", status)],
+                help_text="Sources by result in the last audit.",
+            )
+        w.metric(
+            "streams_manager_audit_timestamp_seconds", state["finished_at"] or 0,
+            help_text="Unix time the last audit finished.",
+        )
+        for result in auditor.results:
+            w.metric(
+                "streams_manager_source_ok",
+                1 if result.status == "ok" else 0,
+                [
+                    ("channel", result.channel_id),
+                    ("channel_name", result.channel_name),
+                    ("source", result.source_id),
+                    ("source_name", result.source_name),
+                    ("network", result.network or ""),
+                ],
+                help_text="1 when a source produced a playable stream in the last audit.",
+            )
 
     mapped = len(epg.resolve(channels))
     w.metric("streams_manager_epg_mapped_channels", mapped,

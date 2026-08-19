@@ -365,6 +365,13 @@ class Settings(BaseModel):
     # Automatically restart a source that exits while clients are attached.
     auto_restart: bool = True
     restart_backoff_seconds: float = Field(default=2.0, ge=0.5, le=60)
+
+    # Pause before reopening a source that ended *after streaming normally*,
+    # e.g. an HLS token or playlist window rotating. Separate from the failure
+    # backoff because this is an expected event, and reopening the instant the
+    # upstream closed is what turns a rotation into a burst of connection
+    # resets. Raise it for a proxy that needs a moment to re-authenticate.
+    reconnect_delay_seconds: float = Field(default=3.0, ge=0, le=120)
     max_restart_backoff_seconds: float = Field(default=30.0, ge=1, le=300)
 
     # Stop retrying after this many consecutive failures. 0 = never stop.
@@ -468,6 +475,9 @@ class SessionState(BaseModel):
     # Seconds since data started flowing, not since the process was spawned.
     uptime_seconds: float
     restarts: int
+    # Clean re-opens after a good run, as distinct from failures.
+    reconnects: int = 0
+    last_end: str = ""
     dropped_chunks: int
     # Chunks dropped on the way *into* a transcoder, i.e. the encoder is too slow.
     input_dropped: int = 0

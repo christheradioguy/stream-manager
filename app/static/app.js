@@ -12,6 +12,7 @@ const state = {
   editingNetwork: null,
   editingEpg: null,
   epg: null,
+  audit: null,
   draftSources: [],   // sources being edited in the channel modal
   baseUrl: "",
   protectStreams: false,
@@ -108,11 +109,16 @@ $$("nav button").forEach((btn) => {
     // The EPG payload is far heavier than the 2s state poll, so it is only
     // fetched when its tab is actually being looked at.
     if (btn.dataset.view === "epg") refreshEpg();
+    if (btn.dataset.view === "audit") refreshAudit();
   });
 });
 
 function epgVisible() {
   return $("#view-epg").classList.contains("active");
+}
+
+function auditVisible() {
+  return $("#view-audit").classList.contains("active");
 }
 
 /* ------------------------------------------------------------- rendering  */
@@ -291,6 +297,8 @@ function renderSessions() {
       <td class="num">${fmtBytes(s.bytes_out)}${slow}</td>
       <td class="num">${tsErrorCell([s])}${(s.ts_error_pids || []).length ? `<div class="sub" title="PIDs losing the most packets">worst pid ${s.ts_error_pids[0].pid} (${s.ts_error_pids[0].errors})</div>` : ""}</td>
       <td class="num">${s.restarts || "—"}</td>
+      <td class="num">${s.reconnects || "—"}${s.last_end && !s.last_error
+          ? `<div class="sub" title="${esc(s.last_end)}">last: ${esc(s.last_end.slice(0, 40))}</div>` : ""}</td>
       <td class="num">${s.dropped_chunks || "—"}</td>
       <td class="sub">${s.pids.join(", ") || "—"}</td>
       <td class="actions">
@@ -366,16 +374,22 @@ async function refresh() {
 }
 
 let epgTimer = null;
+let auditTimer = null;
 
 function startPolling() {
   clearInterval(refreshTimer);
   clearInterval(epgTimer);
+  clearInterval(auditTimer);
   refreshTimer = setInterval(refresh, 2000);
   // Slow poll, and only while the tab is on screen, so a mid-refresh source
   // updates its status without hammering the guide index.
   epgTimer = setInterval(() => {
     if (epgVisible() && $("#epg-modal").hidden) refreshEpg();
   }, 15000);
+  // The audit table needs a faster tick while a run is in progress.
+  auditTimer = setInterval(() => {
+    if (auditVisible() || state.audit?.running) refreshAudit();
+  }, 2000);
   refresh();
 }
 
@@ -1048,6 +1062,93 @@ $("#epg-save").addEventListener("click", async () => {
   finally { btn.disabled = false; btn.textContent = "Save & refresh"; }
 });
 
+/* ------------------------------------------------------------------ audit */
+
+const AUDIT_BADGE = {
+  ok: '<span class="badge running">pass</span>',
+  failed: '<span class="badge error">fail</span>',
+  skipped: '<span class="badge off">skip</span>',
+  testing: '<span class="badge starting">testing</span>',
+  pending: '<span class="badge idle">queued</span>',
+};
+
+function renderAudit() {
+  const a = state.audit;
+  if (!a) return;
+  const running = a.running;
+  $("#audit-start").disabled = running;
+  $("#audit-start").textContent = running ? "Running…" : "Run audit";
+  $("#audit-stop").hidden = !running;
+
+  const c = a.counts || {};
+  if (a.total) {
+    const pct = Math.round((a.completed / a.total) * 100);
+    $("#audit-progress").innerHTML =
+      `<div class="row"><b>${a.completed}/${a.total}</b> checked` +
+      `<span style="color:var(--ok)">${c.ok || 0} pass</span>` +
+      `<span style="color:var(--err)">${c.failed || 0} fail</span>` +
+      (c.skipped ? `<span style="color:var(--warn)">${c.skipped} skipped</span>` : "") +
+      `<span class="sub">${Math.round(a.elapsed)}s</span></div>` +
+      `<div style="background:var(--bg);border:1px solid var(--border);border-radius:4px;height:6px;margin-top:8px;overflow:hidden">` +
+      `<div style="height:100%;width:${pct}%;background:${running ? "var(--accent)" : "var(--ok)"}"></div></div>` +
+      (a.message ? `<div class="sub" style="color:var(--err)">${esc(a.message)}</div>` : "");
+  }
+
+  $("#audit-rows").innerHTML = (a.results || []).map((r) => `
+    <tr data-channel="${esc(r.channel_id)}">
+      <td>${AUDIT_BADGE[r.status] || esc(r.status)}</td>
+      <td><div class="name">${esc(r.channel_name)}</div>
+          <div class="sub">${r.channel_number != null ? r.channel_number + " · " : ""}${esc(r.channel_id)}</div></td>
+      <td>${esc(r.source_name || r.source_id)}
+          ${r.priority ? `<div class="sub">priority ${r.priority}</div>` : ""}</td>
+      <td class="sub">${esc(r.network || "")}</td>
+      <td class="sub">${esc(r.video || "")}</td>
+      <td class="sub">${esc(r.audio || "")}</td>
+      <td class="num">${fmtBits(r.bitrate_bps)}</td>
+      <td>${r.error
+            ? `<span class="sub" style="color:var(--err)" title="${esc(r.stderr || r.error)}">${esc(r.error.slice(0, 70))}</span>`
+            : `<span class="sub">${fmtBytes(r.bytes)} in ${r.duration}s</span>`}</td>
+      <td class="actions">
+        <button class="link small" data-act="retest">Re-test</button>
+      </td>
+    </tr>`).join("");
+  $("#audit-empty").hidden = (a.results || []).length > 0;
+}
+
+async function refreshAudit() {
+  try {
+    state.audit = await api("/api/audit");
+    renderAudit();
+  } catch (err) {
+    if (err.message !== "authentication required") console.error(err);
+  }
+}
+
+async function startAudit(channel) {
+  const params = new URLSearchParams({
+    duration: $("#audit-duration").value || 8,
+    concurrency: $("#audit-concurrency").value || 3,
+  });
+  if (channel) params.set("channel", channel);
+  try {
+    state.audit = await api("/api/audit?" + params.toString(), { method: "POST" });
+    renderAudit();
+  } catch (err) { toast(err.message, "err"); }
+}
+
+$("#audit-start").addEventListener("click", () => startAudit(null));
+$("#audit-stop").addEventListener("click", async () => {
+  try {
+    state.audit = await api("/api/audit/stop", { method: "POST" });
+    renderAudit();
+    toast("Audit stopped");
+  } catch (err) { toast(err.message, "err"); }
+});
+$("#audit-rows").addEventListener("click", (ev) => {
+  const btn = ev.target.closest('button[data-act="retest"]');
+  if (btn) startAudit(btn.closest("tr").dataset.channel);
+});
+
 /* ---------------------------------------------------------------- sessions */
 
 $("#session-rows").addEventListener("click", async (ev) => {
@@ -1102,6 +1203,7 @@ function fillSettings() {
   $("#s-queue").value = s.client_queue_chunks;
   $("#s-startup").value = s.startup_timeout_seconds;
   $("#s-stall").value = s.stall_timeout_seconds;
+  $("#s-reconnect").value = s.reconnect_delay_seconds;
   $("#s-backoff0").value = s.restart_backoff_seconds;
   $("#s-backoff").value = s.max_restart_backoff_seconds;
   $("#s-giveup").value = s.give_up_after_failures;
@@ -1131,6 +1233,7 @@ $("#settings-form").addEventListener("submit", async (ev) => {
     client_queue_chunks: Number($("#s-queue").value),
     startup_timeout_seconds: Number($("#s-startup").value),
     stall_timeout_seconds: Number($("#s-stall").value),
+    reconnect_delay_seconds: Number($("#s-reconnect").value),
     restart_backoff_seconds: Number($("#s-backoff0").value),
     max_restart_backoff_seconds: Number($("#s-backoff").value),
     give_up_after_failures: Number($("#s-giveup").value),

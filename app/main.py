@@ -20,6 +20,7 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 
+from .audit import Auditor
 from .epg import EpgStore, SourceStatus
 from .manager import SessionManager, test_source
 from .metrics import CONTENT_TYPE as METRICS_CONTENT_TYPE
@@ -59,6 +60,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 store = ConfigStore(CONFIG_PATH)
 manager = SessionManager(get_network=lambda nid: store.network(nid))
 epg = EpgStore(CONFIG_PATH.parent / "epg")
+auditor = Auditor(manager.registry)
 
 EPG_TICK_SECONDS = 300
 
@@ -109,6 +111,8 @@ async def lifespan(app: FastAPI):
     scheduler.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await scheduler
+    if auditor.running:
+        await auditor.cancel()
     await manager.shutdown()
 
 
@@ -552,6 +556,45 @@ async def xmltv(request: Request) -> Response:
 
 
 # ---------------------------------------------------------------------------
+# Audit
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/audit", dependencies=admin)
+async def get_audit() -> dict:
+    return auditor.state()
+
+
+@app.post("/api/audit", dependencies=admin)
+async def start_audit(
+    duration: float = Query(default=8.0, ge=2, le=60, description="Seconds to run each source."),
+    concurrency: int = Query(default=3, ge=1, le=16),
+    channel: Optional[str] = Query(default=None, description="Audit one channel only."),
+    include_disabled: bool = Query(default=False),
+) -> dict:
+    if channel and store.channel(channel) is None:
+        raise HTTPException(status_code=404, detail=f"no channel {channel!r}")
+    try:
+        auditor.start(
+            store.sorted_channels(),
+            store.settings,
+            duration=duration,
+            concurrency=concurrency,
+            channel_id=channel,
+            include_disabled=include_disabled,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return auditor.state()
+
+
+@app.post("/api/audit/stop", dependencies=admin)
+async def stop_audit() -> dict:
+    await auditor.cancel()
+    return auditor.state()
+
+
+# ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
 
@@ -699,7 +742,7 @@ async def metrics(request: Request) -> Response:
     """
     if AUTH_TOKEN and not METRICS_PUBLIC and _token_from(request) != AUTH_TOKEN:
         raise HTTPException(status_code=401, detail="invalid or missing token")
-    body = render_metrics(store, manager, epg, app.version)
+    body = render_metrics(store, manager, epg, app.version, auditor)
     return PlainTextResponse(body, media_type=METRICS_CONTENT_TYPE)
 
 

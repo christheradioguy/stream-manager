@@ -160,6 +160,7 @@ class LedgerEntry:
     bytes_out: int = 0
     connections: int = 0
     restarts: int = 0
+    reconnects: int = 0
     dropped_chunks: int = 0
     input_dropped: int = 0
     ts: Counters = field(default_factory=Counters)
