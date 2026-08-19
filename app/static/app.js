@@ -121,6 +121,12 @@ function sessionsFor(channelId) {
   return state.sessions.filter((s) => s.channel_id === channelId);
 }
 
+function allGroups() {
+  const seen = new Set();
+  for (const c of state.channels) for (const g of c.groups || []) seen.add(g);
+  return [...seen].sort((a, b) => a.localeCompare(b));
+}
+
 function networkName(id) {
   if (!id) return "";
   return (state.networks.find((n) => n.id === id) || {}).name || id;
@@ -150,6 +156,23 @@ function renderSourceCell(ch, live) {
           ${shown.use_shell ? '<span class="sub">via shell</span>' : ""}${net}${extra}`;
 }
 
+function tsErrorCell(sessions) {
+  const cc = sessions.reduce((n, s) => n + (s.ts_continuity_errors || 0), 0);
+  const te = sessions.reduce((n, s) => n + (s.ts_transport_errors || 0), 0);
+  const packets = sessions.reduce((n, s) => n + (s.ts_packets || 0), 0);
+  if (!packets) return '<span class="sub">—</span>';
+  if (!cc && !te) return '<span class="badge running">clean</span>';
+  // Errors per million packets is the number that stays comparable between a
+  // channel that has been up for a minute and one up for a day.
+  const ppm = Math.round(((cc + te) / packets) * 1e6);
+  const bad = ppm > 100;
+  const bits = [];
+  if (cc) bits.push(`${cc.toLocaleString()} cont`);
+  if (te) bits.push(`${te.toLocaleString()} tei`);
+  return `<span class="badge ${bad ? "error" : "starting"}">${bits.join(" · ")}</span>` +
+         `<div class="sub">${ppm}/M packets</div>`;
+}
+
 function renderChannels() {
   const tbody = $("#channel-rows");
   tbody.innerHTML = state.channels.map((ch) => {
@@ -173,10 +196,11 @@ function renderChannels() {
       <td><div class="name">${esc(ch.name)}</div><div class="sub">${esc(ch.id)}</div></td>
       <td>${renderSourceCell(ch, live)}
           ${ch.default_profile ? `<span class="sub">default profile: ${esc(ch.default_profile)}</span>` : ""}</td>
-      <td class="sub">${esc(ch.group || "")}</td>
+      <td class="sub">${(ch.groups || []).map(esc).join(", ")}</td>
       <td>${status}${err}</td>
       <td class="num">${clients || "—"}</td>
       <td class="num">${fmtBits(bitrate)}</td>
+      <td class="num">${tsErrorCell(sess)}</td>
       <td class="num">${live ? fmtDuration(live.uptime_seconds) : "—"}</td>
       <td class="actions">
         ${live ? `<button class="link small" data-act="log" data-key="${esc(live.key)}">Log</button>` : ""}
@@ -265,6 +289,7 @@ function renderSessions() {
       <td class="num">${s.clients}</td>
       <td class="num">${fmtBits(s.bitrate_bps)}</td>
       <td class="num">${fmtBytes(s.bytes_out)}${slow}</td>
+      <td class="num">${tsErrorCell([s])}${(s.ts_error_pids || []).length ? `<div class="sub" title="PIDs losing the most packets">worst pid ${s.ts_error_pids[0].pid} (${s.ts_error_pids[0].errors})</div>` : ""}</td>
       <td class="num">${s.restarts || "—"}</td>
       <td class="num">${s.dropped_chunks || "—"}</td>
       <td class="sub">${s.pids.join(", ") || "—"}</td>
@@ -477,7 +502,10 @@ function openChannelModal(channel) {
     ? channel.sources.map((s) => ({ ...s }))
     : [blankSource(0)];
   renderSources();
-  $("#c-group").value = channel?.group ?? "";
+  $("#c-group").value = (channel?.groups ?? []).join(", ");
+  // Offer the groups already in use so they stay consistent across channels.
+  $("#group-list").innerHTML = allGroups()
+    .map((g) => `<option value="${esc(g)}"></option>`).join("");
   $("#c-number").value = channel?.channel_number ?? "";
   $("#c-tvgid").value = channel?.tvg_id ?? "";
   $("#c-logo").value = channel?.logo ?? "";
@@ -497,7 +525,14 @@ function openChannelModal(channel) {
 function channelFromForm() {
   const num = $("#c-number").value.trim();
   const max = $("#c-maxclients").value.trim();
+  // Start from the channel as the server has it. PUT replaces the whole record,
+  // so anything this form does not show - the EPG mapping in particular - has to
+  // be carried over or saving the channel would silently wipe it.
+  const existing = state.editingChannel
+    ? state.channels.find((c) => c.id === state.editingChannel) || {}
+    : {};
   return {
+    ...existing,
     id: $("#c-id").value.trim(),
     name: $("#c-name").value.trim(),
     sources: state.draftSources.map((s, i) => ({
@@ -510,7 +545,7 @@ function channelFromForm() {
       priority: Number(s.priority) || 0,
     })),
     enabled: $("#c-enabled").checked,
-    group: $("#c-group").value.trim(),
+    groups: $("#c-group").value.split(",").map((g) => g.trim()).filter(Boolean),
     logo: $("#c-logo").value.trim(),
     tvg_id: $("#c-tvgid").value.trim(),
     channel_number: num === "" ? null : Number(num),
@@ -798,20 +833,27 @@ function renderEpg() {
     .join("");
 
   const byId = Object.fromEntries((e.channels || []).map((c) => [c.id, c]));
+  // Never rebuild the table out from under someone who is typing in it: the
+  // edit commits on change/blur, and replacing the DOM first would discard it.
+  if ($("#epg-map-rows").contains(document.activeElement)) return;
   $("#epg-map-rows").innerHTML = (e.mapping || []).map((m) => {
     const up = m.matched ? byId[m.matched] : null;
     let status;
     if (!m.epg_enabled) status = '<span class="badge off">excluded</span>';
+    else if (!m.auto_mode && !m.assigned) status = '<span class="badge off">no guide (pinned)</span>';
     else if (!m.matched) status = '<span class="badge error">no guide</span>';
-    else if (m.assigned) status = '<span class="badge running">mapped</span>';
+    else if (!m.auto_mode) status = '<span class="badge running">pinned</span>';
     else status = '<span class="badge starting">auto-matched</span>';
     return `<tr data-id="${esc(m.channel_id)}">
       <td><div class="name">${esc(m.channel_name)}</div><div class="sub">${esc(m.channel_id)}</div></td>
       <td class="sub">${esc(m.guide_id)}</td>
       <td>
-        <input type="text" list="epg-channel-list" data-f="epg" value="${esc(m.assigned || "")}"
-               placeholder="${esc(m.auto ? "auto: " + m.auto : "type to search…")}" style="min-width:230px">
+        <input type="text" list="epg-channel-list" data-f="epg"
+               value="${esc(m.auto_mode ? "" : (m.assigned || ""))}"
+               placeholder="${esc(m.auto ? "auto: " + m.auto : "type to search, or leave blank for no guide")}"
+               style="min-width:230px">
         ${up ? `<div class="sub">${esc(up.label)}</div>` : ""}
+        ${!m.auto_mode ? '<button type="button" class="link small" data-act="auto">use auto-match</button>' : ""}
       </td>
       <td>${status}</td>
       <td class="num">${up ? up.programmes.toLocaleString() : "—"}</td>
@@ -855,10 +897,12 @@ $("#epg-map-rows").addEventListener("change", async (ev) => {
   const channelId = row.dataset.id;
   try {
     if (ev.target.dataset.f === "epg") {
-      await api("/api/epg/mapping", {
-        method: "PUT", body: { mapping: { [channelId]: ev.target.value.trim() || null } },
+      const value = ev.target.value.trim();
+      const r = await api("/api/epg/mapping", {
+        method: "PUT", body: { mapping: { [channelId]: value || null } },
       });
-      toast("Mapping saved");
+      if (r.unknown?.length) toast(`No EPG channel called "${r.unknown[0]}" (yet)`, "err");
+      else toast(value ? "Mapping pinned" : "Pinned to no guide");
     } else if (ev.target.dataset.f === "enabled") {
       const ch = state.channels.find((c) => c.id === channelId);
       await api(`/api/channels/${encodeURIComponent(channelId)}`, {
@@ -870,9 +914,20 @@ $("#epg-map-rows").addEventListener("change", async (ev) => {
   } catch (err) { toast(err.message, "err"); }
 });
 
+$("#epg-map-rows").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest('button[data-act="auto"]');
+  if (!btn) return;
+  const channelId = btn.closest("tr").dataset.id;
+  try {
+    await api("/api/epg/mapping", { method: "PUT", body: { auto: [channelId] } });
+    toast("Back to auto-matching");
+    await Promise.all([refresh(), refreshEpg()]);
+  } catch (err) { toast(err.message, "err"); }
+});
+
 $("#automap").addEventListener("click", () => runAutomap(false));
 $("#automap-all").addEventListener("click", () => {
-  if (!confirm("Re-match every channel? This overwrites mappings you set by hand.")) return;
+  if (!confirm("Re-match every channel?\n\nThis OVERWRITES every mapping you pinned by hand.")) return;
   runAutomap(true);
 });
 
@@ -1061,6 +1116,9 @@ function fillSettings() {
   $("#s-epgpast").value = s.epg_past_hours;
   $("#s-epgfuture").value = s.epg_future_days;
   $("#s-epgplaylist").checked = s.epg_in_playlist;
+  $("#s-multigroup").checked = s.playlist_multi_group;
+  $("#s-tsanalysis").checked = s.ts_analysis;
+  $("#s-sort").value = s.channel_sort;
 }
 
 $("#settings-form").addEventListener("input", () => { settingsDirty = true; });
@@ -1087,6 +1145,9 @@ $("#settings-form").addEventListener("submit", async (ev) => {
     epg_past_hours: Number($("#s-epgpast").value),
     epg_future_days: Number($("#s-epgfuture").value),
     epg_in_playlist: $("#s-epgplaylist").checked,
+    playlist_multi_group: $("#s-multigroup").checked,
+    ts_analysis: $("#s-tsanalysis").checked,
+    channel_sort: $("#s-sort").value,
   };
   try {
     await api("/api/settings", { method: "PUT", body });

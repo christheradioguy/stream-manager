@@ -845,6 +845,79 @@ def main() -> int:
               not any(p.findtext("title") == "Ancient History" for p in root.findall("programme")))
         api.request("PUT", "/api/settings", settings_now)
 
+        # ---- mappings must survive everything ------------------------------
+        # The reported failure: pin a mapping, then add or edit channels, and the
+        # pin quietly reverts to a wrong auto-match.
+        print("\nEPG mapping stability")
+        api.request("PUT", "/api/epg/mapping", {"mapping": {"news": "sports.example"}})
+        status, ep = api.request("GET", "/api/epg")
+        news = next(m for m in ep["mapping"] if m["channel_id"] == "news")
+        check("a pinned mapping is recorded as pinned",
+              news["assigned"] == "sports.example" and news["auto_mode"] is False,
+              f"assigned={news['assigned']} auto={news['auto_mode']}")
+
+        # Adding an unrelated channel must not disturb it.
+        api.request("POST", "/api/channels", {
+            "id": "newcomer", "name": "News 24",   # deliberately collides by name
+            "sources": [{"id": "s1", "command": TEST_SOURCE}],
+        })
+        status, ep = api.request("GET", "/api/epg")
+        news = next(m for m in ep["mapping"] if m["channel_id"] == "news")
+        check("adding a channel leaves pinned mappings alone",
+              news["matched"] == "sports.example", f"matched={news['matched']}")
+
+        # Saving the channel from the GUI form must not wipe it. The GUI sends the
+        # whole record, so this mimics a form that carries the fields it does not show.
+        status, chans = api.request("GET", "/api/channels")
+        ch = next(c for c in chans if c["id"] == "news")
+        api.request("PUT", "/api/channels/news", {**ch, "name": "News 24 HD"})
+        status, ep = api.request("GET", "/api/epg")
+        news = next(m for m in ep["mapping"] if m["channel_id"] == "news")
+        check("editing a channel keeps its pinned mapping",
+              news["assigned"] == "sports.example" and news["auto_mode"] is False,
+              f"assigned={news['assigned']} auto={news['auto_mode']}")
+
+        # Auto-match must never touch a pinned channel.
+        status, r = api.request("POST", "/api/epg/automap", timeout=30)
+        status, ep = api.request("GET", "/api/epg")
+        news = next(m for m in ep["mapping"] if m["channel_id"] == "news")
+        check("auto-match skips pinned channels",
+              news["assigned"] == "sports.example", f"assigned={news['assigned']}")
+
+        # Clearing a mapping means "no guide", not "guess again".
+        api.request("PUT", "/api/epg/mapping", {"mapping": {"news": None}})
+        status, ep = api.request("GET", "/api/epg")
+        news = next(m for m in ep["mapping"] if m["channel_id"] == "news")
+        check("clearing a mapping pins 'no guide' rather than reverting to auto",
+              news["matched"] is None and news["auto_mode"] is False,
+              f"matched={news['matched']} auto={news['auto_mode']}")
+        status, xml = api.text("/xmltv.xml", timeout=30)
+        check("a channel pinned to no guide is absent from the XMLTV",
+              "news24.example" not in [c.get("id") for c in ET.fromstring(xml).findall("channel")])
+
+        # And it stays cleared across an auto-match run.
+        api.request("POST", "/api/epg/automap", timeout=30)
+        status, ep = api.request("GET", "/api/epg")
+        news = next(m for m in ep["mapping"] if m["channel_id"] == "news")
+        check("'no guide' survives an auto-match run", news["matched"] is None,
+              f"matched={news['matched']}")
+
+        # Releasing it puts the channel back on auto-matching.
+        api.request("PUT", "/api/epg/mapping", {"auto": ["news"]})
+        status, ep = api.request("GET", "/api/epg")
+        news = next(m for m in ep["mapping"] if m["channel_id"] == "news")
+        check("releasing a channel restores auto-matching",
+              news["auto_mode"] is True and news["matched"] == "news24.example",
+              f"auto={news['auto_mode']} matched={news['matched']}")
+
+        # Pinning an id the guide has not seen yet is allowed but reported.
+        status, r = api.request("PUT", "/api/epg/mapping",
+                                {"mapping": {"news": "not.in.guide"}})
+        check("pinning an unknown id is accepted and flagged",
+              r.get("unknown") == ["not.in.guide"], str(r))
+        api.request("PUT", "/api/epg/mapping", {"auto": ["news"]})
+        api.request("DELETE", "/api/channels/newcomer")
+
         status, bad = api.request("POST", "/api/epg/sources", {
             "id": "broken", "name": "Broken", "kind": "command", "command": "false",
         })

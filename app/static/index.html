@@ -60,10 +60,11 @@
             <th style="width:1%"></th>
             <th>Name</th>
             <th>Source command</th>
-            <th>Group</th>
+            <th>Groups</th>
             <th>Status</th>
             <th class="num">Clients</th>
             <th class="num">Bitrate</th>
+            <th class="num">TS errors</th>
             <th class="num">Uptime</th>
             <th></th>
           </tr>
@@ -170,7 +171,7 @@
       <h2>Channel mapping
         <div class="spacer"></div>
         <span class="sub" id="epg-map-summary"></span>
-        <button class="small" id="automap">Auto-match unmapped</button>
+        <button class="small" id="automap">Auto-match unpinned</button>
         <button class="small" id="automap-all">Re-match all</button>
       </h2>
       <table>
@@ -298,6 +299,15 @@
               </select>
             </div>
             <div class="field">
+              <label for="s-sort">Channel order</label>
+              <select id="s-sort" name="channel_sort">
+                <option value="number">Channel number, unnumbered last</option>
+                <option value="name">Name, A to Z</option>
+                <option value="manual">As configured</option>
+              </select>
+              <div class="hint">Applies to the GUI, the playlist and the guide alike.</div>
+            </div>
+            <div class="field">
               <label for="s-loglines">Log lines kept per session</label>
               <input type="number" id="s-loglines" name="log_lines" step="10" min="10" max="5000">
             </div>
@@ -323,6 +333,16 @@
             <label for="s-autorestart">Automatically restart a source that dies while clients are watching</label>
           </div>
           <div class="field check">
+            <input type="checkbox" id="s-tsanalysis" name="ts_analysis">
+            <label for="s-tsanalysis">Count MPEG-TS transport and continuity errors
+              (a per-packet check; turn off only if CPU is tight)</label>
+          </div>
+          <div class="field check">
+            <input type="checkbox" id="s-multigroup" name="playlist_multi_group">
+            <label for="s-multigroup">List a channel once per group when it belongs to
+              several (turn off if your client shows them as duplicate channels)</label>
+          </div>
+          <div class="field check">
             <input type="checkbox" id="s-epgplaylist" name="epg_in_playlist">
             <label for="s-epgplaylist">Advertise the guide URL in the playlist header
               (<code>url-tvg</code>) so clients find it automatically</label>
@@ -342,6 +362,7 @@
           <tr>
             <th>Session</th><th>Kind</th><th>Status</th><th class="num">Clients</th>
             <th class="num">Bitrate</th><th class="num">Data</th>
+            <th class="num">TS errors</th>
             <th class="num">Restarts</th><th class="num">Dropped</th><th>PIDs</th><th></th>
           </tr>
         </thead>
@@ -382,8 +403,11 @@
         </div>
         <div class="grid">
           <div class="field">
-            <label for="c-group">Group</label>
-            <input type="text" id="c-group" placeholder="News">
+            <label for="c-group">Groups</label>
+            <input type="text" id="c-group" list="group-list" placeholder="News, UK, Favourites">
+            <datalist id="group-list"></datalist>
+            <div class="hint">Comma-separated. A channel in several groups is listed
+              once per group in the playlist.</div>
           </div>
           <div class="field">
             <label for="c-number">Channel number</label>

@@ -287,11 +287,28 @@ Matching to an upstream XMLTV channel is tried in descending confidence:
    `HD`, `UHD`, `SD`, `TV` are ignored, so `Movie Channel HD` finds
    `movies.example` named *Movie Channel*.
 
-**Auto-match unmapped** applies the guesses; **Re-match all** redoes everything
-including manual choices. Anything auto-matched shows as such, so you can see
-what was guessed versus what you pinned. Setting a mapping by hand always wins,
-and the *include* checkbox drops a channel from the guide while leaving it in the
+### Pinned vs auto
+
+Every channel is in one of three states, shown as a badge in the mapping table:
+
+| State | Meaning |
+|---|---|
+| **auto-matched** | No choice made; the guide is matched by name on every request, and follows whatever your sources currently offer. |
+| **pinned** | You set it by hand. Nothing changes it — not adding channels, not editing the channel, not **Auto-match unpinned**. |
+| **no guide (pinned)** | You deliberately cleared it. It stays empty; auto-matching will not put a guess back. |
+
+Clearing a mapping pins "no guide" rather than reverting to a guess — otherwise
+correcting a bad auto-match would be impossible, since the same wrong guess would
+return immediately. **use auto-match** on the row puts a channel back on auto.
+
+**Auto-match unpinned** guesses for channels still on auto and pins the results.
+**Re-match all** overwrites *everything*, pinned choices included — it asks first.
+
+The *include* checkbox drops a channel from the guide while leaving it in the
 playlist.
+
+You can pin an id before the guide that defines it has been fetched; it is
+accepted and flagged rather than rejected.
 
 One upstream channel can feed several of yours — useful when you carry the same
 channel from two providers and want the guide on both.

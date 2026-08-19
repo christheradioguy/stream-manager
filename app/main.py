@@ -429,9 +429,10 @@ def _epg_state() -> dict:
                 "channel_name": c.name,
                 "guide_id": c.guide_id(),
                 "epg_enabled": c.epg_enabled,
+                "auto_mode": c.epg_auto,
                 "assigned": c.epg_channel,
                 "matched": resolved.get(c.id),
-                "auto": epg.suggest(c) if not c.epg_channel else None,
+                "auto": epg.suggest(c) if c.epg_auto else None,
             }
             for c in store.sorted_channels()
         ],
@@ -504,7 +505,8 @@ async def automap_epg(overwrite: bool = Query(default=False)) -> dict:
     """
     mapping: dict[str, Optional[str]] = {}
     for channel in store.channels:
-        if channel.epg_channel and not overwrite:
+        # A pinned mapping is a deliberate choice; only `overwrite` may undo it.
+        if not channel.epg_auto and not overwrite:
             continue
         suggestion = epg.suggest(channel)
         if suggestion:
@@ -516,11 +518,18 @@ async def automap_epg(overwrite: bool = Query(default=False)) -> dict:
 
 @app.put("/api/epg/mapping", dependencies=admin)
 async def set_epg_mapping(body: EpgMappingRequest) -> dict:
+    unknown = [c for c in body.mapping.values() if c and c not in epg.channels]
     try:
-        await store.set_epg_mapping(body.mapping)
+        await store.set_epg_mapping(body.mapping, body.auto)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"updated": len(body.mapping)}
+    return {
+        "pinned": len(body.mapping),
+        "released": len(body.auto),
+        # Not an error: a mapping may be set before the guide that defines it is
+        # fetched. Reported so the GUI can point it out.
+        "unknown": unknown,
+    }
 
 
 @app.api_route("/xmltv.xml", methods=["GET", "HEAD"])

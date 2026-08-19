@@ -105,7 +105,11 @@ class Channel(BaseModel):
     tvg_id: str = ""
     channel_number: Optional[int] = None
 
-    # Which XMLTV channel id supplies this channel's guide. None = auto-match.
+    # Guide mapping. While epg_auto is true the guide is matched by name on every
+    # request; once a mapping is set by hand epg_auto goes false and epg_channel
+    # is authoritative - including when it is None, which then means "no guide"
+    # rather than "guess again".
+    epg_auto: bool = True
     epg_channel: Optional[str] = None
     # Set to opt a channel out of the guide even when a match exists.
     epg_enabled: bool = True
@@ -139,6 +143,11 @@ class Channel(BaseModel):
                     "use_shell": data.pop("use_shell", False),
                 }
             ]
+        # A mapping stored before epg_auto existed was set by hand, so keep it
+        # pinned rather than letting auto-matching take it back.
+        if data.get("epg_channel") and "epg_auto" not in data:
+            data = dict(data)
+            data["epg_auto"] = False
         # Channels written before a channel could be in several groups carry a
         # single `group` string.
         if "group" in data and not data.get("groups"):
@@ -424,9 +433,14 @@ class ReorderRequest(BaseModel):
 
 
 class EpgMappingRequest(BaseModel):
-    """channel id -> upstream XMLTV id. An empty value clears the mapping."""
+    """Pin guide mappings, and/or release channels back to auto-matching.
 
-    mapping: dict[str, Optional[str]]
+    A null value in ``mapping`` pins "no guide" for that channel, which is
+    different from listing it in ``auto``.
+    """
+
+    mapping: dict[str, Optional[str]] = Field(default_factory=dict)
+    auto: list[str] = Field(default_factory=list)
 
 
 class TestRequest(BaseModel):

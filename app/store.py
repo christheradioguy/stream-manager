@@ -307,15 +307,31 @@ class ConfigStore:
                 raise KeyError(f"no EPG source {source_id!r}")
             self._write()
 
-    async def set_epg_mapping(self, mapping: dict[str, Optional[str]]) -> None:
-        """Bulk-assign channel.epg_channel, for the mapping table and auto-match."""
+    async def set_epg_mapping(
+        self,
+        mapping: Optional[dict[str, Optional[str]]] = None,
+        auto: Optional[list[str]] = None,
+    ) -> None:
+        """Pin or release guide mappings.
+
+        Anything in ``mapping`` is pinned, and a null value pins "no guide" -
+        otherwise clearing a wrong mapping would just let auto-matching put the
+        same wrong guide straight back. Ids in ``auto`` go back to auto-matching.
+        """
         async with self._lock:
             by_id = {c.id: c for c in self._config.channels}
-            for channel_id, upstream in mapping.items():
+            for channel_id, upstream in (mapping or {}).items():
                 channel = by_id.get(channel_id)
                 if channel is None:
                     raise KeyError(f"no channel {channel_id!r}")
                 channel.epg_channel = upstream or None
+                channel.epg_auto = False
+            for channel_id in auto or []:
+                channel = by_id.get(channel_id)
+                if channel is None:
+                    raise KeyError(f"no channel {channel_id!r}")
+                channel.epg_auto = True
+                channel.epg_channel = None
             self._write()
 
     async def update_settings(self, settings: Settings) -> Settings:

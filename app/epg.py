@@ -348,7 +348,7 @@ class EpgStore:
         for channel in channels:
             if not channel.enabled or not channel.epg_enabled:
                 continue
-            upstream = channel.epg_channel or self.suggest(channel)
+            upstream = self.suggest(channel) if channel.epg_auto else channel.epg_channel
             if upstream and upstream in self.channels:
                 resolved[channel.id] = upstream
         return resolved
