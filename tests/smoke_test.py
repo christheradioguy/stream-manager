@@ -79,6 +79,107 @@ PASSED: list[str] = []
 FAILED: list[str] = []
 
 
+# Emits MPEG-TS with deliberate faults: every 50th packet skips a continuity
+# counter, and every 97th sets the transport_error_indicator.
+CORRUPT_TS_SOURCE = r'''
+import os, sys, time
+PID = 0x0100
+cc = 0
+n = 0
+buf = bytearray()
+while n < 20000:
+    n += 1
+    pkt = bytearray(188)
+    pkt[0] = 0x47
+    tei = 0x80 if n % 97 == 0 else 0
+    pkt[1] = ((PID >> 8) & 0x1F) | tei
+    pkt[2] = PID & 0xFF
+    if n % 50 == 0:
+        cc = (cc + 2) & 0x0F        # skip one -> continuity error
+    else:
+        cc = (cc + 1) & 0x0F
+    pkt[3] = 0x10 | cc              # payload only
+    buf += pkt
+    if len(buf) >= 188 * 100:
+        sys.stdout.buffer.write(buf)
+        sys.stdout.buffer.flush()
+        buf.clear()
+        time.sleep(0.01)
+'''
+
+
+def metrics_parse(body: str) -> dict[str, list[tuple[str, float]]]:
+    """Parse Prometheus exposition into {name: [(labels, value), ...]}."""
+    out: dict[str, list[tuple[str, float]]] = {}
+    for line in body.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        match = re.match(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*\})?\s+(-?[\d.eE+]+)$", line)
+        if not match:
+            raise AssertionError(f"unparseable metric line: {line!r}")
+        name, labels, value = match.groups()
+        out.setdefault(name, []).append((labels or "", float(value)))
+    return out
+
+
+def run_analyser_checks() -> None:
+    """Unit-level checks on the TS analyser, where faults can be exact."""
+    sys.path.insert(0, str(ROOT))
+    from app.tsstats import TSAnalyser
+
+    def pkt(pid, cc, tei=0, afc=0x01, disc=False):
+        b = bytearray(188)
+        b[0] = 0x47
+        b[1] = ((pid >> 8) & 0x1F) | (0x80 if tei else 0)
+        b[2] = pid & 0xFF
+        b[3] = (afc << 4) | (cc & 0x0F)
+        if afc & 0x02:
+            b[4] = 1
+            b[5] = 0x80 if disc else 0
+        return bytes(b)
+
+    a = TSAnalyser()
+    a.feed(b"".join(pkt(256, c) for c in range(6)))
+    check("analyser: clean sequence has no errors",
+          a.counters.continuity_errors == 0 and a.counters.packets == 6)
+
+    a.feed(pkt(256, 7))  # skipped 6
+    check("analyser: a skipped counter is one error", a.counters.continuity_errors == 1)
+
+    a.feed(pkt(256, 7))
+    check("analyser: one duplicate packet is legal", a.counters.continuity_errors == 1)
+    a.feed(pkt(256, 7))
+    check("analyser: a second duplicate is an error", a.counters.continuity_errors == 2)
+
+    a.feed(pkt(256, 8, tei=1))
+    check("analyser: transport_error_indicator is counted",
+          a.counters.transport_errors == 1)
+
+    a.feed(pkt(0x1FFF, 0))
+    check("analyser: null packets are ignored, not errors",
+          a.counters.nulls == 1 and a.counters.continuity_errors == 2)
+
+    b = TSAnalyser()
+    b.feed(b"".join(pkt(100, c) for c in range(3)))
+    b.feed(pkt(100, 9, afc=0x03, disc=True))
+    b.feed(pkt(100, 10))
+    check("analyser: a signalled discontinuity is not an error",
+          b.counters.discontinuities == 1 and b.counters.continuity_errors == 0)
+
+    c = TSAnalyser()
+    c.feed(b"".join(pkt(200, c2, afc=0x02) for c2 in (0, 0, 0)))
+    check("analyser: packets without payload do not advance the counter",
+          c.counters.continuity_errors == 0)
+
+    d = TSAnalyser()
+    d.feed(b"".join(pkt(300, 0) for _ in range(2)) + b"".join(pkt(400, 0) for _ in range(2)))
+    check("analyser: PIDs are tracked independently", d.counters.continuity_errors == 0)
+
+    off = TSAnalyser(enabled=False)
+    off.feed(b"".join(pkt(256, 0) for _ in range(4)))
+    check("analyser: can be disabled", off.counters.packets == 0)
+
+
 def is_valid_xml(text: str) -> bool:
     try:
         ET.fromstring(text)
@@ -351,6 +452,95 @@ def main() -> int:
 
         status, body = api.text("/playlist.m3u8?profile=nope")
         check("unknown profile rejected", status == 400)
+
+        # ---- channel ordering ------------------------------------------------
+        print("\nChannel ordering")
+        # Deliberately created out of order, with a gap and two unnumbered.
+        for cid, name, num in [("ord-c", "Charlie", 30), ("ord-a", "Alpha", 10),
+                               ("ord-z", "Zulu", None), ("ord-b", "Bravo", 20),
+                               ("ord-d", "Delta", None)]:
+            body = {"id": cid, "name": name, "sources": [{"id": "s1", "command": TEST_SOURCE}]}
+            if num is not None:
+                body["channel_number"] = num
+            api.request("POST", "/api/channels", body)
+
+        def listed(path="/playlist.m3u8"):
+            _, text = api.text(path)
+            return [i for i in re.findall(r'tvg-id="(ord-[a-z])"', text)]
+
+        def api_order():
+            _, chans = api.request("GET", "/api/channels")
+            return [c["id"] for c in chans if c["id"].startswith("ord-")]
+
+        check("playlist is in channel-number order",
+              listed()[:3] == ["ord-a", "ord-b", "ord-c"], str(listed()))
+        check("unnumbered channels come last",
+              set(listed()[3:]) == {"ord-z", "ord-d"}, str(listed()))
+        check("the API (and so the GUI) uses the same order",
+              api_order() == listed(), f"api={api_order()} playlist={listed()}")
+
+        settings_now = api.request("GET", "/api/settings")[1]
+        api.request("PUT", "/api/settings", {**settings_now, "channel_sort": "name"})
+        check("name order sorts alphabetically",
+              listed() == ["ord-a", "ord-b", "ord-c", "ord-d", "ord-z"], str(listed()))
+
+        api.request("PUT", "/api/settings", {**settings_now, "channel_sort": "manual"})
+        check("manual order keeps the configured order",
+              listed() == ["ord-c", "ord-a", "ord-z", "ord-b", "ord-d"], str(listed()))
+        api.request("PUT", "/api/settings", {**settings_now, "channel_sort": "number"})
+
+        # Renumbering must move a channel without touching anything else.
+        ch = next(c for c in api.request("GET", "/api/channels")[1] if c["id"] == "ord-c")
+        api.request("PUT", "/api/channels/ord-c", {**ch, "channel_number": 5})
+        check("changing a number reorders immediately",
+              listed()[0] == "ord-c", str(listed()))
+
+        for cid in ("ord-a", "ord-b", "ord-c", "ord-d", "ord-z"):
+            api.request("DELETE", f"/api/channels/{cid}")
+
+        # ---- multiple groups ------------------------------------------------
+        print("\nMultiple groups")
+        api.request("POST", "/api/channels", {
+            "id": "multi", "name": "Multi", "groups": ["News", "UK", "News", " "],
+            "sources": [{"id": "s1", "command": TEST_SOURCE}],
+        })
+        status, saved = api.request("GET", "/api/channels")
+        multi = next(c for c in saved if c["id"] == "multi")
+        check("groups are de-duplicated and trimmed", multi["groups"] == ["News", "UK"],
+              str(multi["groups"]))
+
+        status, body = api.text("/playlist.m3u8")
+        entries = [ln for ln in body.splitlines() if 'tvg-id="multi"' in ln]
+        check("channel is listed once per group", len(entries) == 2, f"{len(entries)} entries")
+        check("each entry carries a different group-title",
+              sorted(re.findall(r'group-title="([^"]+)"', "\n".join(entries))) == ["News", "UK"],
+              str(re.findall(r'group-title="([^"]+)"', "\n".join(entries))))
+        check("both entries share one id and one URL",
+              body.count("/stream/multi\n") == 2 and len(set(entries)) == 2)
+
+        status, body = api.text("/playlist.m3u8?group=UK")
+        check("?group= matches any of a channel's groups",
+              'tvg-id="multi"' in body and 'group-title="UK"' in body)
+        status, body = api.text("/playlist.m3u8?group=News")
+        check("?group= matches the other group too", 'tvg-id="multi"' in body)
+
+        settings_now = api.request("GET", "/api/settings")[1]
+        api.request("PUT", "/api/settings", {**settings_now, "playlist_multi_group": False})
+        status, body = api.text("/playlist.m3u8")
+        entries = [ln for ln in body.splitlines() if 'tvg-id="multi"' in ln]
+        check("multi_group off lists the channel once", len(entries) == 1,
+              f"{len(entries)} entries")
+        api.request("PUT", "/api/settings", settings_now)
+
+        # A pre-multi-group config used a single `group` string.
+        status, legacy = api.request("POST", "/api/channels", {
+            "id": "legacygrp", "name": "Legacy", "group": "Sport",
+            "sources": [{"id": "s1", "command": TEST_SOURCE}],
+        })
+        check("legacy single `group` migrates to a list",
+              status == 201 and legacy["groups"] == ["Sport"], str(legacy.get("groups")))
+        api.request("DELETE", "/api/channels/multi")
+        api.request("DELETE", "/api/channels/legacygrp")
 
         # ---- passthrough streaming --------------------------------------
         print("\nStreaming (passthrough)")
@@ -671,6 +861,88 @@ def main() -> int:
         api.request("DELETE", "/api/channels/news")
         api.request("DELETE", "/api/channels/movies")
         api.request("DELETE", "/api/epg/sources/main")
+
+        # ---- TS error analysis ---------------------------------------------
+        print("\nMPEG-TS error counters")
+        run_analyser_checks()
+
+        api.request("POST", "/api/channels", {
+            "id": "clean", "name": "Clean", "sources": [{"id": "s1", "command": TEST_SOURCE}],
+        })
+        data = read_stream(f"{base}/stream/clean", 188 * 600)
+        check("clean stream produces data", len(data) > 0, f"{len(data)} bytes")
+        status, sessions = api.request("GET", "/api/sessions")
+        clean = next((s for s in sessions if s["channel_id"] == "clean"), None)
+        if clean:
+            check("packets are counted", clean["ts_packets"] > 100,
+                  f"packets={clean['ts_packets']}")
+            check("a locally generated stream has no errors",
+                  clean["ts_continuity_errors"] == 0 and clean["ts_transport_errors"] == 0,
+                  f"cont={clean['ts_continuity_errors']} tei={clean['ts_transport_errors']}")
+
+        # A source that emits deliberately corrupt TS must be counted, not hidden.
+        corrupt = tmpdir / "corrupt.py"
+        corrupt.write_text(CORRUPT_TS_SOURCE)
+        api.request("POST", "/api/channels", {
+            "id": "dirty", "name": "Dirty",
+            "sources": [{"id": "s1", "command": f"{PY} {corrupt}"}],
+        })
+        read_stream(f"{base}/stream/dirty", 188 * 400, timeout=25)
+        status, sessions = api.request("GET", "/api/sessions")
+        dirty = next((s for s in sessions if s["channel_id"] == "dirty"), None)
+        if dirty:
+            check("continuity errors are detected", dirty["ts_continuity_errors"] > 0,
+                  f"cont={dirty['ts_continuity_errors']}")
+            check("transport errors are detected", dirty["ts_transport_errors"] > 0,
+                  f"tei={dirty['ts_transport_errors']}")
+            check("the worst PID is identified", bool(dirty["ts_error_pids"]),
+                  str(dirty["ts_error_pids"][:2]))
+
+        # ---- Prometheus ------------------------------------------------------
+        print("\nPrometheus metrics")
+        status, body = api.text("/metrics")
+        check("GET /metrics", status == 200 and body.startswith("# HELP"), body[:60])
+        check("exposition format is parseable", metrics_parse(body) is not None)
+        names = metrics_parse(body)
+        for name in ("streams_manager_build_info", "streams_manager_channels",
+                     "streams_manager_clients", "streams_manager_bytes_total",
+                     "streams_manager_ts_continuity_errors_total",
+                     "streams_manager_ts_transport_errors_total",
+                     "streams_manager_network_max_streams",
+                     "streams_manager_epg_mapped_channels"):
+            check(f"exposes {name}", name in names)
+        check("every metric declares a TYPE",
+              all(f"# TYPE {n} " in body for n in names), "")
+        check("counters carry TS errors from the ledger",
+              any(v > 0 for k, v in names["streams_manager_ts_continuity_errors_total"]),
+              str(names["streams_manager_ts_continuity_errors_total"][:2]))
+        # A channel name is operator-supplied text that lands in a label value,
+        # so quotes and backslashes must not be able to break the format.
+        api.request("POST", "/api/channels", {
+            "id": "quoted", "name": 'He said "hi" \\ bye',
+            "sources": [{"id": "s1", "command": TEST_SOURCE}],
+        })
+        hold_stream(f"{base}/stream/quoted", 3)
+        status, body = api.text("/metrics")
+        quoted_lines = [ln for ln in body.splitlines() if "quoted" in ln and not ln.startswith("#")]
+        check("quotes and backslashes in labels are escaped",
+              any(r'He said \"hi\" \\ bye' in ln for ln in quoted_lines),
+              quoted_lines[0][:100] if quoted_lines else "no lines")
+        check("escaped output still parses", metrics_parse(body) is not None)
+        api.request("DELETE", "/api/channels/quoted")
+
+        # Ledger counters must survive the session being torn down.
+        before = sum(v for _, v in names["streams_manager_ts_packets_total"])
+        api.request("POST", "/api/sessions/dirty/stop")
+        time.sleep(2)
+        status, body = api.text("/metrics")
+        after_names = metrics_parse(body)
+        after = sum(v for _, v in after_names["streams_manager_ts_packets_total"])
+        check("counters do not reset when a session stops", after >= before,
+              f"{before} -> {after}")
+
+        api.request("DELETE", "/api/channels/clean")
+        api.request("DELETE", "/api/channels/dirty")
 
         # ---- teardown ----------------------------------------------------
         print("\nIdle teardown")

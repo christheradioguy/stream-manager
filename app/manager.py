@@ -14,6 +14,7 @@ import time
 from typing import Callable, Optional
 
 from .models import Channel, Network, Profile, Settings
+from .tsstats import StatsLedger
 from .session import (
     Broadcaster,
     NetworkRegistry,
@@ -41,6 +42,9 @@ class SessionManager:
         self._sessions: dict[str, Broadcaster] = {}
         self._lock = asyncio.Lock()
         self.registry = NetworkRegistry(get_network)
+        # Totals that outlive individual sessions, so Prometheus counters do not
+        # reset every time a channel goes idle.
+        self.ledger = StatsLedger()
 
     async def get_output(
         self, channel: Channel, profile: Optional[Profile], settings: Settings
@@ -61,6 +65,9 @@ class SessionManager:
                 return existing
 
             transcoder = TranscodeSession(source, profile, settings, self._forget)
+            transcoder.ledger = self.ledger.entry(
+                key, channel.id, channel.name, profile.id, "transcode"
+            )
             self._sessions[key] = transcoder
             return transcoder
 
@@ -72,6 +79,9 @@ class SessionManager:
             return existing
 
         candidate = SourceSession(channel, settings, self._forget, self.registry)
+        candidate.ledger = self.ledger.entry(
+            channel.id, channel.id, channel.name, "", "source"
+        )
         if candidate.select_source() is None:
             # Not registered yet, so there is nothing to clean up - just refuse.
             raise NoCapacity(f"{channel.name}: {candidate.describe_unavailable()}")

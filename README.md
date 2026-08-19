@@ -33,7 +33,8 @@ concurrent streams and refuse the second one.
   link will serve at once. Over the cap, requests are refused rather than queued.
 - **On-demand transcoding** — `?profile=<id>` runs the output through an ffmpeg
   profile you define in the GUI. No profile means untouched passthrough.
-- **m3u8 output** — `/playlist.m3u8` for Jellyfin, Kodi, VLC, Emby, or any IPTV client.
+- **m3u8 output** — `/playlist.m3u8` for Jellyfin, Kodi, VLC, Emby, or any IPTV client,
+  with channels in as many groups as you like.
 - **XMLTV guide** — merges any number of EPG sources, maps them onto your channels
   and serves `/xmltv.xml` with ids rewritten to match the playlist.
 - **One upstream connection per channel** — however many viewers, whatever mix
@@ -46,6 +47,10 @@ concurrent streams and refuse the second one.
 - **Self-healing** — dead sources restart with exponential backoff; stalled ones
   are detected and restarted; a failing transcode profile never takes the
   upstream connection down with it.
+- **Stream health** — transport and continuity errors counted per session and per
+  PID, so a flaky provider is visible rather than guessed at.
+- **Prometheus metrics** — `/metrics` exposes sessions, throughput, TS errors,
+  network capacity and EPG freshness.
 - **Live status** — per-session state, client count, bitrate, restarts and a
   tail of the command's stderr, all in the GUI.
 - **Source tester** — run a command for a few seconds and see ffprobe's verdict
@@ -160,6 +165,47 @@ you are at your provider's ceiling.
 
 Note that `-re` is only for file/lavfi inputs. Live sources are already paced by
 the sender, and adding `-re` will make the stream drift behind.
+
+## Channel order
+
+Channels are listed in **channel-number order** by default — in the GUI, the
+playlist and the guide alike, all from one sorter so they can never disagree.
+Channels without a number come last, keeping their configured order, and equal
+numbers stay in configured order too.
+
+**Channel order** in Settings offers:
+
+| Mode | Order |
+|---|---|
+| `number` (default) | Ascending channel number, unnumbered last |
+| `name` | Alphabetical by name |
+| `manual` | Exactly as configured, via `POST /api/channels/reorder` |
+
+Editing a channel's number moves it immediately; there is nothing to re-save.
+Note that most clients apply their own sorting on top — TiVimate sorts by
+`tvg-chno` when it is present, which is emitted for every numbered channel.
+
+## Groups
+
+A channel can belong to any number of groups. M3U carries one `group-title` per
+entry, so a channel in several groups is emitted **once per group** — same
+`tvg-id`, same stream URL, one line each:
+
+```
+#EXTINF:-1 tvg-id="bbc1" tvg-name="BBC One" group-title="UK",BBC One
+http://host:8409/stream/bbc1
+#EXTINF:-1 tvg-id="bbc1" tvg-name="BBC One" group-title="Favourites",BBC One
+http://host:8409/stream/bbc1
+```
+
+Clients that key on `tvg-id` — TiVimate, OTT Navigator, IPTVnator — show the one
+channel under each group, and the guide still matches because the id never
+changes. If a client instead shows them as duplicate channels, turn off
+**List a channel once per group** in Settings and only the first group is used.
+
+Enter them comma-separated in the channel editor; groups already in use are
+offered as suggestions. `/playlist.m3u8?group=UK` filters to channels in that
+group, matching any of a channel's groups.
 
 ## Transcode profiles
 
@@ -294,6 +340,83 @@ lag badly.
 | **Terminate grace** | How long a process gets to exit on SIGTERM before it is killed. Raise it if you see `ignored SIGTERM, killing` in the log. |
 | **Default max clients** | Viewer cap per channel, counted across all profiles. 0 = unlimited. |
 
+## Stream health
+
+Every packet relayed is checked for the two standard transport-stream faults:
+
+| Counter | Meaning |
+|---|---|
+| **Transport error** | The `transport_error_indicator` bit is set — an upstream demodulator or muxer marked the packet as containing uncorrectable errors. Anything above zero means the signal or link is damaged. |
+| **Continuity error** | A PID's 4-bit continuity counter did not advance by one. This is packet loss, and the direct cause of macroblocking and audio dropouts. |
+
+The counting follows the spec rather than approximating it: null packets are
+ignored, packets carrying no payload correctly do not advance the counter, one
+duplicate packet is legal (a second in a row is not), and a discontinuity the
+adaptation field explicitly signals is recorded separately instead of being
+counted as a fault. PIDs are tracked independently, and the GUI names the PID
+losing the most packets — usually enough to tell a bad video feed from a bad
+audio one.
+
+Channel and session rows show errors both as a raw count and **per million
+packets**, which is the figure that stays comparable between a channel up for a
+minute and one up for a week. Under 10/M is generally unnoticeable; over 100/M is
+visible on screen.
+
+Analysis is a per-packet Python loop. It is cheap, but **Count MPEG-TS transport
+and continuity errors** in Settings turns it off if a very busy server needs the
+CPU back.
+
+## Prometheus
+
+`/metrics` serves the standard text exposition format.
+
+```yaml
+scrape_configs:
+  - job_name: streams-manager
+    static_configs:
+      - targets: ["tv.lan:8409"]
+    # Only when STREAMS_MANAGER_TOKEN is set:
+    authorization:
+      credentials: your-token-here
+```
+
+The endpoint requires the admin token when one is set. Set
+`STREAMS_MANAGER_METRICS_PUBLIC=1` to leave it open for a scraper that cannot
+send a header.
+
+| Metric | Type | Labels |
+|---|---|---|
+| `streams_manager_channels`, `_channels_enabled`, `_sources`, `_profiles` | gauge | |
+| `streams_manager_sessions` | gauge | `kind` |
+| `streams_manager_clients` | gauge | |
+| `streams_manager_session_up` | gauge | `channel`, `channel_name`, `kind`, `profile`, `source`, `network` |
+| `streams_manager_session_clients`, `_bitrate_bps`, `_uptime_seconds` | gauge | as above |
+| `streams_manager_bytes_total` | counter | `channel`, `kind`, `profile` |
+| `streams_manager_connections_total`, `_restarts_total` | counter | as above |
+| `streams_manager_ts_packets_total` | counter | as above |
+| `streams_manager_ts_transport_errors_total` | counter | as above |
+| `streams_manager_ts_continuity_errors_total` | counter | as above |
+| `streams_manager_network_streams`, `_max_streams`, `_enabled` | gauge | `network` |
+| `streams_manager_epg_up`, `_channels`, `_programmes`, `_age_seconds` | gauge | `source` |
+| `streams_manager_epg_mapped_channels`, `_cache_bytes` | gauge | |
+
+Counters come from a ledger that outlives individual sessions, so a channel going
+idle and starting again does not look like a counter reset.
+
+Useful queries:
+
+```promql
+# Packet loss per channel, errors per million
+1e6 * rate(streams_manager_ts_continuity_errors_total[5m])
+    / rate(streams_manager_ts_packets_total[5m])
+
+# Networks at capacity
+streams_manager_network_streams >= streams_manager_network_max_streams > 0
+
+# A guide that has stopped refreshing
+streams_manager_epg_age_seconds > 86400
+```
+
 ## API
 
 Everything the GUI does is available directly.
@@ -302,6 +425,7 @@ Everything the GUI does is available directly.
 GET    /playlist.m3u8[?profile=&group=]
 GET    /stream/{id}[?profile=]
 GET    /xmltv.xml                       the merged guide (also /epg.xml)
+GET    /metrics                         Prometheus exposition
 GET    /healthz
 
 GET    /api/state                       everything at once
@@ -346,9 +470,9 @@ a bug, but it means the port is as sensitive as a shell.
 
 Everything lives in one JSON file, default
 `~/.config/streams-manager/config.json`, override with `STREAMS_MANAGER_CONFIG`.
-Channels written before multiple sources existed carry `command` and `use_shell`
-at the top level; those are folded into a single source on load, so older configs
-keep working and are rewritten in the new shape on the next change.
+Older shapes are migrated on load and rewritten on the next change, so existing
+configs keep working: a top-level `command`/`use_shell` becomes a single source,
+and a single `group` string becomes a one-entry `groups` list.
 It is written atomically on every change and is safe to edit by hand while the
 server is stopped. A file that fails to parse is moved aside to `.broken` rather
 than silently discarded.
@@ -362,6 +486,7 @@ than silently discarded.
 | `STREAMS_MANAGER_PORT` | `8409` | Bind port |
 | `STREAMS_MANAGER_TOKEN` | *(unset)* | Bearer token for the admin API and GUI |
 | `STREAMS_MANAGER_PROTECT_STREAMS` | *(unset)* | Also require the token on streams and the playlist |
+| `STREAMS_MANAGER_METRICS_PUBLIC` | *(unset)* | Serve `/metrics` without the token |
 | `STREAMS_MANAGER_LOGLEVEL` | `INFO` | Server log level |
 
 ## Tests
@@ -396,6 +521,8 @@ transcoder ended (exit code 8): Error opening output files: Encoder not found
 | `produced no data for Ns` | The command connected but never emitted anything — wrong URL, expired auth, or missing `-f mpegts pipe:1`. Use **Test source**. |
 | `ignored SIGTERM, killing` | The command traps or ignores SIGTERM. Harmless, but raise **Terminate grace** to let it exit cleanly. |
 | `encoder behind: N dropped` | The transcode can't run in real time on this CPU. Faster preset, lower resolution, or hardware encoding. |
+| Rising continuity errors | Packet loss upstream. Check the network path to the provider; the worst-PID hint in the session row narrows it to video or audio. |
+| Rising transport errors | The source itself is marking packets corrupt — a bad tuner, aerial or upstream link, not something this server can fix. |
 | Stream plays then dies after ~30s | Source stopped producing. Check the log; if the source is just slow, raise **Stall timeout**. |
 | `503 every source is blocked` | The channel's networks are at capacity or disabled. Check the Networks tab; raise the cap, or give the channel a source on another network. |
 | Client shows no guide | The tvg-id in the playlist must match a `<channel id>` in the XMLTV. Check the EPG tab's mapping table — anything showing **no guide** has no match. |

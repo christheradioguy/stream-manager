@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from .models import Channel, Config, EpgSource, Network, Profile, Settings
+from .models import Channel, Config, EpgSource, Network, Profile, Settings, sort_channels
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +132,10 @@ class ConfigStore:
     @property
     def profiles(self) -> list[Profile]:
         return list(self._config.profiles)
+
+    def sorted_channels(self) -> list[Channel]:
+        """Channels in display order, used by the GUI, playlist and guide alike."""
+        return sort_channels(self._config.channels, self._config.settings.channel_sort)
 
     def channel(self, channel_id: str) -> Optional[Channel]:
         return next((c for c in self._config.channels if c.id == channel_id), None)

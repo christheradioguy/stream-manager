@@ -29,6 +29,7 @@ from collections import deque
 from typing import AsyncIterator, Awaitable, Callable, Optional
 
 from .models import Channel, Network, Profile, SessionState, Settings, Source
+from .tsstats import LedgerEntry, TSAnalyser
 
 log = logging.getLogger(__name__)
 
@@ -271,6 +272,11 @@ class Broadcaster:
         self._logs: deque[str] = deque(maxlen=settings.log_lines)
         self._bitrate_window: deque[tuple[float, int]] = deque()
 
+        # Stream health for this session, plus the process-lifetime ledger that
+        # survives the session being torn down and recreated.
+        self.analyser = TSAnalyser(enabled=settings.ts_analysis)
+        self.ledger: Optional[LedgerEntry] = None
+
         self._procs: list[asyncio.subprocess.Process] = []
         self._runner: Optional[asyncio.Task] = None
         self._idle_timer: Optional[asyncio.Task] = None
@@ -339,6 +345,8 @@ class Broadcaster:
                 # viewer sit through a backoff that exists for flaky networks.
                 self.status = "restarting"
                 self.restarts += 1
+                if self.ledger is not None:
+                    self.ledger.restarts += 1
                 self._log("--- failing over to the next source ---")
                 continue
             if not self.settings.auto_restart:
@@ -352,6 +360,8 @@ class Broadcaster:
 
             self.status = "restarting"
             self.restarts += 1
+            if self.ledger is not None:
+                self.ledger.restarts += 1
             self._log(f"--- retry {self.failures} in {backoff:.0f}s ---")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, self.settings.max_restart_backoff_seconds)
@@ -411,6 +421,17 @@ class Broadcaster:
 
     def publish(self, chunk: bytes) -> None:
         self.bytes_out += len(chunk)
+        if self._ts_output:
+            before = self.analyser.counters
+            packets, terr, cerr = before.packets, before.transport_errors, before.continuity_errors
+            self.analyser.feed(chunk)
+            after = self.analyser.counters
+            if self.ledger is not None:
+                self.ledger.ts.packets += after.packets - packets
+                self.ledger.ts.transport_errors += after.transport_errors - terr
+                self.ledger.ts.continuity_errors += after.continuity_errors - cerr
+        if self.ledger is not None:
+            self.ledger.bytes_out += len(chunk)
         self._record_bitrate(len(chunk))
         self._push_prebuffer(chunk)
         for sub in list(self._subscribers):
@@ -622,6 +643,7 @@ class Broadcaster:
 
     def state(self) -> SessionState:
         now = time.monotonic()
+        c = self.analyser.counters
         return SessionState(
             key=self.key,
             kind=self.kind,  # type: ignore[arg-type]
@@ -638,6 +660,12 @@ class Broadcaster:
             restarts=self.restarts,
             dropped_chunks=sum(s.dropped for s in self._subscribers),
             input_dropped=0,
+            ts_packets=c.packets,
+            ts_transport_errors=c.transport_errors,
+            ts_continuity_errors=c.continuity_errors,
+            ts_scrambled=c.scrambled,
+            ts_discontinuities=c.discontinuities,
+            ts_error_pids=self.analyser.worst_pids(),
             last_error=self.last_error,
             pids=[p.pid for p in self._procs if p.returncode is None],
         )
@@ -770,6 +798,8 @@ class SourceSession(Broadcaster):
 
         self._tried.add(source.id)
         self.active_source = source
+        if self.ledger is not None:
+            self.ledger.connections += 1
         cmd = source.command
         where = f" on {source.network}" if source.network else ""
         self._log(f"--- source {source.label()}{where}: {cmd} ---")

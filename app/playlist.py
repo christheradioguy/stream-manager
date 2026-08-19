@@ -49,12 +49,19 @@ def build_playlist(
         attrs = [f'tvg-id="{_attr(ch.guide_id())}"', f'tvg-name="{_attr(ch.name)}"']
         if ch.logo:
             attrs.append(f'tvg-logo="{_attr(ch.logo)}"')
-        if ch.group:
-            attrs.append(f'group-title="{_attr(ch.group)}"')
         if ch.channel_number is not None:
             attrs.append(f'tvg-chno="{ch.channel_number}"')
 
-        lines.append(f"#EXTINF:-1 {' '.join(attrs)},{ch.name}")
-        lines.append(url)
+        # M3U allows a single group-title per entry, so a channel that belongs to
+        # several groups is emitted once per group, sharing one id and one URL.
+        groups = ch.groups or [""]
+        if not settings.playlist_multi_group:
+            groups = groups[:1]
+        for group_title in groups:
+            entry = list(attrs)
+            if group_title:
+                entry.append(f'group-title="{_attr(group_title)}"')
+            lines.append(f"#EXTINF:-1 {' '.join(entry)},{ch.name}")
+            lines.append(url)
 
     return "\n".join(lines) + "\n"

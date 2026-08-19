@@ -22,6 +22,8 @@ from fastapi.staticfiles import StaticFiles
 
 from .epg import EpgStore, SourceStatus
 from .manager import SessionManager, test_source
+from .metrics import CONTENT_TYPE as METRICS_CONTENT_TYPE
+from .metrics import render as render_metrics
 from .models import (
     Channel,
     EpgMappingRequest,
@@ -43,6 +45,11 @@ CONFIG_PATH = Path(
 ).expanduser()
 AUTH_TOKEN = os.environ.get("STREAMS_MANAGER_TOKEN", "").strip()
 PROTECT_STREAMS = os.environ.get("STREAMS_MANAGER_PROTECT_STREAMS", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+METRICS_PUBLIC = os.environ.get("STREAMS_MANAGER_METRICS_PUBLIC", "").lower() in (
     "1",
     "true",
     "yes",
@@ -183,7 +190,7 @@ def _network_usage() -> list[dict]:
 async def get_state(request: Request) -> dict:
     return {
         "settings": store.settings.model_dump(),
-        "channels": [c.model_dump() for c in store.channels],
+        "channels": [c.model_dump() for c in store.sorted_channels()],
         "profiles": [p.model_dump() for p in store.profiles],
         "networks": _network_usage(),
         "sessions": [s.state().model_dump() for s in manager.all()],
@@ -220,7 +227,7 @@ async def session_log(key: str) -> dict:
 
 @app.get("/api/channels", dependencies=admin)
 async def list_channels() -> list[dict]:
-    return [c.model_dump() for c in store.channels]
+    return [c.model_dump() for c in store.sorted_channels()]
 
 
 @app.post("/api/channels", dependencies=admin, status_code=201)
@@ -426,7 +433,7 @@ def _epg_state() -> dict:
                 "matched": resolved.get(c.id),
                 "auto": epg.suggest(c) if not c.epg_channel else None,
             }
-            for c in store.channels
+            for c in store.sorted_channels()
         ],
         "matched": len(resolved),
         "total_channels": len(store.channels),
@@ -531,7 +538,7 @@ async def xmltv(request: Request) -> Response:
     if request.method == "HEAD":
         return Response(status_code=200, media_type="application/xml", headers=headers)
 
-    body = epg.generate(store.channels, store.settings, store.epg_sources)
+    body = epg.generate(store.sorted_channels(), store.settings, store.epg_sources)
     return StreamingResponse(body, media_type="application/xml", headers=headers)
 
 
@@ -569,14 +576,16 @@ async def playlist(
         description="Bake a transcode profile into every URL. Omit to use each "
         "channel's own default.",
     ),
-    group: Optional[str] = Query(default=None, description="Only channels in this group."),
+    group: Optional[str] = Query(
+        default=None, description="Only channels belonging to this group."
+    ),
 ) -> Response:
     if profile and not store.profile(profile):
         raise HTTPException(status_code=400, detail=f"no profile {profile!r}")
 
-    channels = store.channels
+    channels = store.sorted_channels()
     if group:
-        channels = [c for c in channels if c.group == group]
+        channels = [c for c in channels if group in c.groups]
 
     token = _token_from(request) if (AUTH_TOKEN and PROTECT_STREAMS) else None
     body = build_playlist(channels, store.settings, _base_url(request), profile, token)
@@ -669,6 +678,20 @@ async def stream(
             "Access-Control-Allow-Origin": "*",
         },
     )
+
+
+@app.api_route("/metrics", methods=["GET", "HEAD"], response_class=PlainTextResponse)
+async def metrics(request: Request) -> Response:
+    """Prometheus scrape endpoint.
+
+    Protected by the admin token when one is set, which Prometheus supplies via
+    `authorization: credentials:`. Set STREAMS_MANAGER_METRICS_PUBLIC=1 to leave
+    it open for a scraper that cannot send a header.
+    """
+    if AUTH_TOKEN and not METRICS_PUBLIC and _token_from(request) != AUTH_TOKEN:
+        raise HTTPException(status_code=401, detail="invalid or missing token")
+    body = render_metrics(store, manager, epg, app.version)
+    return PlainTextResponse(body, media_type=METRICS_CONTENT_TYPE)
 
 
 @app.get("/healthz", include_in_schema=False)

@@ -100,7 +100,7 @@ class Channel(BaseModel):
     enabled: bool = True
 
     # Playlist metadata
-    group: str = ""
+    groups: list[str] = Field(default_factory=list)
     logo: str = ""
     tvg_id: str = ""
     channel_number: Optional[int] = None
@@ -127,7 +127,9 @@ class Channel(BaseModel):
         and `use_shell` at the top level. Fold them into one source so existing
         files keep working untouched.
         """
-        if isinstance(data, dict) and data.get("command") and not data.get("sources"):
+        if not isinstance(data, dict):
+            return data
+        if data.get("command") and not data.get("sources"):
             data = dict(data)
             data["sources"] = [
                 {
@@ -137,7 +139,23 @@ class Channel(BaseModel):
                     "use_shell": data.pop("use_shell", False),
                 }
             ]
+        # Channels written before a channel could be in several groups carry a
+        # single `group` string.
+        if "group" in data and not data.get("groups"):
+            data = dict(data)
+            single = (data.pop("group") or "").strip()
+            data["groups"] = [single] if single else []
         return data
+
+    @field_validator("groups")
+    @classmethod
+    def _clean_groups(cls, v: list[str]) -> list[str]:
+        seen: list[str] = []
+        for group in v:
+            group = group.strip()
+            if group and group not in seen:
+                seen.append(group)
+        return seen
 
     @model_validator(mode="after")
     def _check_sources(self) -> "Channel":
@@ -173,6 +191,30 @@ class Channel(BaseModel):
 
     def source(self, source_id: str) -> Optional[Source]:
         return next((s for s in self.sources if s.id == source_id), None)
+
+
+def sort_channels(channels: list[Channel], mode: str = "number") -> list[Channel]:
+    """Order channels for display and for the playlist.
+
+    ``number`` puts numbered channels in ascending order and any without a number
+    after them, keeping the configured order as the tiebreak so equal numbers stay
+    stable. ``manual`` leaves the configured order alone.
+    """
+    if mode == "manual":
+        return list(channels)
+    if mode == "name":
+        return sorted(channels, key=lambda c: (c.name.lower(), c.id))
+    return [
+        channel
+        for _, channel in sorted(
+            enumerate(channels),
+            key=lambda pair: (
+                pair[1].channel_number is None,
+                pair[1].channel_number if pair[1].channel_number is not None else 0,
+                pair[0],
+            ),
+        )
+    ]
 
 
 class Profile(BaseModel):
@@ -335,11 +377,25 @@ class Settings(BaseModel):
     # Lines of stderr kept per source for the GUI log view.
     log_lines: int = Field(default=200, ge=10, le=5000)
 
+    # Count transport and continuity errors on every packet. Cheap, but it is a
+    # per-packet Python loop, so it can be turned off on a very busy server.
+    ts_analysis: bool = True
+
+    # How channels are ordered in the GUI, the playlist and the guide.
+    channel_sort: Literal["number", "name", "manual"] = "number"
+
+
     # Guide trimming, so clients are not handed weeks of history.
     epg_past_hours: float = Field(default=12.0, ge=0, le=720)
     epg_future_days: float = Field(default=14.0, ge=0, le=90)  # 0 = no limit
     # Advertise the guide URL in the playlist so clients discover it themselves.
     epg_in_playlist: bool = True
+
+    # M3U carries one group-title per entry, so a channel in several groups is
+    # listed once per group. Clients that key on tvg-id (TiVimate, OTT Navigator)
+    # show it in each group; turn this off for a client that instead shows one
+    # duplicate channel per entry, and only the first group is used.
+    playlist_multi_group: bool = True
 
     @field_validator("public_base_url")
     @classmethod
@@ -403,6 +459,14 @@ class SessionState(BaseModel):
     input_dropped: int = 0
     last_error: str = ""
     pids: list[int] = Field(default_factory=list)
+    # MPEG-TS health for this session.
+    ts_packets: int = 0
+    ts_transport_errors: int = 0
+    ts_continuity_errors: int = 0
+    ts_scrambled: int = 0
+    ts_discontinuities: int = 0
+    ts_error_pids: list[dict[str, int]] = Field(default_factory=list)
+
     # Which of the channel's sources is currently in use, and the pool it draws on.
     source_id: Optional[str] = None
     source_name: str = ""
