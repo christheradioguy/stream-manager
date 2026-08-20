@@ -354,6 +354,13 @@ class Settings(BaseModel):
     # rather than stalling every other viewer of the same source.
     client_queue_chunks: int = Field(default=256, ge=8, le=8192)
 
+    # How long to wait for a consumer whose queue is full before dropping its
+    # oldest data. Waiting stops the source pipe being read, so the source
+    # process blocks and a burst is absorbed upstream instead of being thrown
+    # away - which is what a faster-than-real-time input needs. 0 restores the
+    # old drop-immediately behaviour.
+    backpressure_seconds: float = Field(default=20.0, ge=0, le=300)
+
     # Restart the source if it stops producing data mid-stream.
     stall_timeout_seconds: float = Field(default=30.0, ge=5, le=600)
 

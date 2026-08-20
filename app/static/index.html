@@ -298,6 +298,13 @@
                 byte. Raise it for sources that are slow to connect or authenticate.</div>
             </div>
             <div class="field">
+              <label for="s-backpressure">Hold back a slow client for (s)</label>
+              <input type="number" id="s-backpressure" name="backpressure_seconds" step="1" min="0" max="300">
+              <div class="hint">A source faster than real time is paused rather than having
+                its excess thrown away. Only a client still behind after this long loses
+                data. 0 drops immediately.</div>
+            </div>
+            <div class="field">
               <label for="s-stall">Stall timeout (s)</label>
               <input type="number" id="s-stall" name="stall_timeout_seconds" step="1" min="5" max="600">
               <div class="hint">Restart a source that stops producing data mid-stream.</div>

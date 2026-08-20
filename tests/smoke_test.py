@@ -12,6 +12,7 @@ Requires ffmpeg/ffprobe on PATH.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -178,6 +179,20 @@ def run_analyser_checks() -> None:
     off = TSAnalyser(enabled=False)
     off.feed(b"".join(pkt(256, 0) for _ in range(4)))
     check("analyser: can be disabled", off.counters.packets == 0)
+
+
+def ts_continuity_errors(data: bytes) -> int:
+    """Continuity errors in a captured stream, via the server's own analyser."""
+    sys.path.insert(0, str(ROOT))
+    from app.tsstats import TSAnalyser
+
+    analyser = TSAnalyser()
+    analyser.feed(data)
+    return analyser.counters.continuity_errors
+
+
+def dup_status_409(status: int, body) -> bool:
+    return status == 409 and "already running" in str(body)
 
 
 def is_valid_xml(text: str) -> bool:
@@ -1016,6 +1031,316 @@ def main() -> int:
 
         api.request("DELETE", "/api/channels/clean")
         api.request("DELETE", "/api/channels/dirty")
+
+        # ---- source audit ----------------------------------------------------
+        print("\nSource audit")
+        api.request("POST", "/api/networks", {
+            "id": "auditnet", "name": "Audit net", "max_streams": 1,
+        })
+        api.request("POST", "/api/channels", {
+            "id": "aud1", "name": "Audit One", "channel_number": 1,
+            "sources": [
+                {"id": "good", "name": "Good", "priority": 10, "network": "auditnet",
+                 "command": TEST_SOURCE},
+                {"id": "dead", "name": "Dead", "priority": 5, "command": "false"},
+            ],
+        })
+        api.request("POST", "/api/channels", {
+            "id": "aud2", "name": "Audit Two", "channel_number": 2,
+            "sources": [{"id": "good", "name": "Good", "network": "auditnet",
+                         "command": TEST_SOURCE}],
+        })
+
+        # Other channels from earlier sections are still configured, so assert on
+        # the ones this section owns rather than on the whole run.
+        mine = {"aud1/good", "aud1/dead", "aud2/good"}
+        started = time.time()
+        status, run = api.request("POST", "/api/audit?duration=4&concurrency=4")
+        check("POST /api/audit starts a run", status == 200 and run["total"] >= 3,
+              f"total={run.get('total')}")
+        check("audit enumerates every source up front",
+              mine.issubset({r["key"] for r in run["results"]}),
+              str(sorted(r["key"] for r in run["results"])))
+
+        status, dup = api.request("POST", "/api/audit")
+        check("a second concurrent audit is refused", dup_status_409(status, dup), str(status))
+
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            time.sleep(2)
+            status, run = api.request("GET", "/api/audit")
+            if not run["running"]:
+                break
+        elapsed = time.time() - started
+        check("audit completes", run["status"] == "done", run["status"])
+
+        by_key = {r["key"]: r for r in run["results"]}
+        check("a working source passes", by_key["aud1/good"]["status"] == "ok",
+              by_key["aud1/good"]["error"])
+        check("audit reports the video format",
+              "640x360" in by_key["aud1/good"]["video"], by_key["aud1/good"]["video"])
+        check("audit reports the audio format",
+              "aac" in by_key["aud1/good"]["audio"], by_key["aud1/good"]["audio"])
+        check("audit measures a bitrate", by_key["aud1/good"]["bitrate_bps"] > 0,
+              f"{by_key['aud1/good']['bitrate_bps']}")
+        check("a dead source fails with a reason",
+              by_key["aud1/dead"]["status"] == "failed" and by_key["aud1/dead"]["error"],
+              by_key["aud1/dead"]["error"])
+        statuses = [by_key[k]["status"] for k in sorted(mine)]
+        check("counts summarise the run",
+              statuses.count("ok") == 2 and statuses.count("failed") == 1,
+              f"{statuses} overall={run['counts']}")
+
+        # Two sources share a network capped at one, so despite concurrency=4 they
+        # must have run one after the other rather than both at once.
+        check("audit honours network capacity", elapsed >= 8,
+              f"3 sources, 4s each, cap 1 on two of them -> {elapsed:.0f}s")
+
+        status, one = api.request("POST", "/api/audit?duration=3&channel=aud2")
+        check("a single channel can be audited", one["total"] == 1, f"total={one['total']}")
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            time.sleep(1)
+            status, one = api.request("GET", "/api/audit")
+            if not one["running"]:
+                break
+        check("single-channel audit finishes", one["status"] == "done", one["status"])
+
+        status, bad = api.request("POST", "/api/audit?channel=nosuch")
+        check("auditing an unknown channel is a 404", status == 404, str(status))
+
+        # Stopping mid-run must not leave sources stuck as pending.
+        api.request("POST", "/api/audit?duration=30&concurrency=1")
+        time.sleep(2)
+        status, stopped = api.request("POST", "/api/audit/stop")
+        check("POST /api/audit/stop cancels the run", stopped["status"] == "cancelled",
+              stopped["status"])
+        check("cancelled sources are marked skipped, not left pending",
+              not any(r["status"] in ("pending", "testing") for r in stopped["results"]),
+              str([r["status"] for r in stopped["results"]]))
+        time.sleep(1)
+        status, net = api.request("GET", "/api/networks")
+        auditnet = next(n for n in net if n["id"] == "auditnet")
+        check("a cancelled audit releases its network slots", auditnet["in_use"] == 0,
+              f"in_use={auditnet['in_use']}")
+
+        status, body = api.text("/metrics")
+        check("audit results reach Prometheus",
+              "streams_manager_source_ok" in body and "streams_manager_audit_sources" in body)
+
+        api.request("DELETE", "/api/channels/aud1")
+        api.request("DELETE", "/api/channels/aud2")
+        api.request("DELETE", "/api/networks/auditnet")
+
+        # ---- rotating source (streams, ends cleanly, must reopen politely) ----
+        # Reproduces a live HLS source whose token or playlist window rotates:
+        # it streams fine, exits 0, and must be reopened after a settle pause
+        # rather than instantly - reopening at once is what produced a burst of
+        # connection resets against the upstream.
+        print("\nRotating source (reopen, not failure)")
+        rotator = tmpdir / "rotator.sh"
+        attempts = tmpdir / "rotator.log"
+        rotator.write_text(
+            "#!/bin/sh\n"
+            f'date +%s.%N >> "{attempts}"\n'
+            "exec ffmpeg -hide_banner -loglevel error -re "
+            "-f lavfi -i testsrc2=size=320x180:rate=15 "
+            "-c:v libx264 -preset ultrafast -g 15 -t 18 -f mpegts pipe:1\n"
+        )
+        rotator.chmod(0o755)
+        attempts.write_text("")
+
+        settings_now = api.request("GET", "/api/settings")[1]
+        api.request("PUT", "/api/settings", {**settings_now, "reconnect_delay_seconds": 5})
+        api.request("POST", "/api/channels", {
+            "id": "rot", "name": "Rotator",
+            "sources": [{"id": "s1", "name": "Rotating", "command": f"sh {rotator}"}],
+        })
+
+        # Hold a viewer across at least one rotation.
+        held = hold_stream(f"{base}/stream/rot", 34)
+        check("viewer keeps receiving data across a rotation", held > 100_000,
+              f"{held} bytes")
+
+        status, sessions = api.request("GET", "/api/sessions")
+        rot = next((s for s in sessions if s["channel_id"] == "rot"), None)
+        if rot:
+            check("a clean end after a good run counts as a reopen, not a failure",
+                  rot["reconnects"] >= 1, f"reconnects={rot['reconnects']}")
+            check("a reopen does not leave the session in error",
+                  rot["status"] in ("running", "restarting") and not rot["last_error"],
+                  f"status={rot['status']} err={rot['last_error']!r}")
+            check("the reason for the last end is still reported",
+                  bool(rot["last_end"]), rot["last_end"])
+
+        stamps = [float(x) for x in attempts.read_text().split()]
+        gaps = [round(b - a, 1) for a, b in zip(stamps, stamps[1:])]
+        # The source runs 18s, so consecutive starts should be ~18s + the 5s
+        # settle pause. Without the pause they were about 18s apart.
+        check("reopen waits the settle delay instead of retrying instantly",
+              bool(gaps) and all(g >= 22 for g in gaps), f"start gaps: {gaps}")
+
+        status, body = api.text("/metrics")
+        check("reopens are exposed to Prometheus",
+              "streams_manager_reconnects_total" in body)
+
+        api.request("PUT", "/api/settings", settings_now)
+        api.request("DELETE", "/api/channels/rot")
+
+        # ---- orphaned helper processes ---------------------------------------
+        # The case that matters: the source forks a helper and then exits *by
+        # itself*, with no client attached. The helper would otherwise keep the
+        # upstream connection open, so the next attempt becomes a second
+        # connection and the provider resets it.
+        print("\nOrphaned helper processes")
+        heartbeat = tmpdir / "helper-heartbeat"
+        orphan = tmpdir / "orphan.sh"
+        orphan.write_text(
+            "#!/bin/sh\n"
+            "# A helper that outlives its parent, as streamlink's muxer would.\n"
+            f'( while true; do echo tick >> "{heartbeat}"; sleep 0.3; done ) &\n'
+            "exec ffmpeg -hide_banner -loglevel error -re "
+            "-f lavfi -i testsrc2=size=320x180:rate=15 "
+            "-c:v libx264 -preset ultrafast -g 15 -t 5 -f mpegts pipe:1\n"
+        )
+        orphan.chmod(0o755)
+        heartbeat.write_text("")
+
+        api.request("PUT", "/api/settings", {**settings_now, "linger_seconds": 2})
+        api.request("POST", "/api/channels", {
+            "id": "orph", "name": "Orphan maker",
+            "sources": [{"id": "s1", "command": f"sh {orphan}"}],
+        })
+        # Leave before the source's own 5s runtime is up, so it exits on its own
+        # with nobody watching - the path that used to skip cleanup entirely.
+        hold_stream(f"{base}/stream/orph", 3)
+        check("the helper ran while the source was up",
+              len(heartbeat.read_text().splitlines()) > 0,
+              f"{len(heartbeat.read_text().splitlines())} ticks")
+
+        time.sleep(20)  # source self-exits, linger passes, session is released
+        settled = len(heartbeat.read_text().splitlines())
+        time.sleep(4)
+        after = len(heartbeat.read_text().splitlines())
+        check("a helper orphaned by a self-exiting source is reaped",
+              after == settled, f"{settled} -> {after} ticks (still running = leaked)")
+
+        leaked = subprocess.run(
+            ["pgrep", "-f", str(heartbeat)], capture_output=True, text=True
+        ).stdout.strip()
+        check("no helper processes survive", not leaked, f"pids {leaked}")
+        if leaked:
+            for pid in leaked.split():
+                with contextlib.suppress(Exception):
+                    os.kill(int(pid), 9)
+
+        api.request("DELETE", "/api/channels/orph")
+        api.request("PUT", "/api/settings", settings_now)
+
+        # ---- faster-than-real-time source ------------------------------------
+        # An HLS input downloads its segment backlog at line speed, so the source
+        # runs far ahead of a player consuming at the content's own rate. The
+        # excess must be held back by making the source block, not discarded -
+        # discarding bytes mid-transport-stream is what produces glitching.
+        print("\nBursty source (backpressure, not dropping)")
+        # No -re, so ffmpeg produces as fast as the CPU allows, like a backlog download.
+        BURST = (
+            "ffmpeg -hide_banner -loglevel error "
+            "-f lavfi -i testsrc2=size=1280x720:rate=25 "
+            "-c:v libx264 -preset ultrafast -b:v 8000k -g 25 -t 90 -f mpegts pipe:1"
+        )
+        api.request("POST", "/api/channels", {
+            "id": "burst", "name": "Bursty",
+            "sources": [{"id": "s1", "command": BURST}],
+        })
+
+        def slow_reader(url: str, seconds: float, path: Path) -> int:
+            """Consume at roughly a real player's rate, well under the burst."""
+            total = 0
+            deadline = time.time() + seconds
+            with open(path, "wb") as out:
+                try:
+                    with urllib.request.urlopen(url, timeout=seconds + 20) as resp:
+                        while time.time() < deadline:
+                            chunk = resp.read(64 * 1024)
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                            total += len(chunk)
+                            time.sleep(0.05)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"    (reader ended: {exc})")
+            return total
+
+        capture = tmpdir / "burst.ts"
+        got = slow_reader(f"{base}/stream/burst", 25, capture)
+        check("slow client receives data from a bursty source", got > 1_000_000,
+              f"{got / 1e6:.1f} MB")
+
+        status, sessions = api.request("GET", "/api/sessions")
+        burst = next((s for s in sessions if s["channel_id"] == "burst"), None)
+        if burst:
+            check("no data is dropped when the source outruns the client",
+                  burst["dropped_chunks"] == 0, f"dropped={burst['dropped_chunks']}")
+
+        data = capture.read_bytes()
+        analyser_errors = ts_continuity_errors(data)
+        source_errors = burst["ts_continuity_errors"] if burst else 0
+        check("the client's stream has no continuity errors the source did not",
+              analyser_errors <= source_errors,
+              f"client {analyser_errors} vs source {source_errors} "
+              f"in {len(data) / 1e6:.1f} MB")
+        check("captured output stays packet-aligned", is_aligned(data),
+              f"sync offset={sync_offset(data)}")
+
+        # Drop counts must survive the client detaching, or this whole class of
+        # fault stays invisible in the GUI.
+        api.request("POST", "/api/sessions/burst/stop")
+        time.sleep(1)
+        api.request("DELETE", "/api/channels/burst")
+
+        # With backpressure disabled the same run must lose data - otherwise the
+        # check above proves nothing.
+        api.request("PUT", "/api/settings", {**settings_now, "backpressure_seconds": 0})
+        api.request("POST", "/api/channels", {
+            "id": "burst2", "name": "Bursty 2",
+            "sources": [{"id": "s1", "command": BURST}],
+        })
+        capture2 = tmpdir / "burst2.ts"
+        slow_reader(f"{base}/stream/burst2", 20, capture2)
+        status, sessions = api.request("GET", "/api/sessions")
+        burst2 = next((s for s in sessions if s["channel_id"] == "burst2"), None)
+        dropped2 = burst2["dropped_chunks"] if burst2 else 0
+        check("without backpressure the same source does lose data", dropped2 > 0,
+              f"dropped={dropped2} (confirms the test discriminates)")
+        check("drop counts survive the client disconnecting", dropped2 > 0,
+              f"counted {dropped2} after the reader finished")
+        api.request("PUT", "/api/settings", settings_now)
+        api.request("DELETE", "/api/channels/burst2")
+
+        # A client that stops reading entirely must not hold up anyone else.
+        print("\nStalled client isolation")
+        api.request("PUT", "/api/settings", {
+            **settings_now, "backpressure_seconds": 3, "client_queue_chunks": 8,
+        })
+        api.request("POST", "/api/channels", {
+            "id": "stall", "name": "Stall test",
+            "sources": [{"id": "s1", "command": TEST_SOURCE}],
+        })
+        frozen = urllib.request.urlopen(f"{base}/stream/stall", timeout=60)
+        frozen.read(65536)          # attach, then never read again
+        time.sleep(12)              # long enough for its small queue to fill
+        healthy = hold_stream(f"{base}/stream/stall", 8)
+        check("a healthy client keeps streaming past a frozen one", healthy > 500_000,
+              f"{healthy / 1e6:.1f} MB")
+        status, sessions = api.request("GET", "/api/sessions")
+        st = next((s for s in sessions if s["channel_id"] == "stall"), None)
+        check("the frozen client is the one that loses data",
+              bool(st) and st["dropped_chunks"] > 0, f"dropped={st['dropped_chunks'] if st else 0}")
+        with contextlib.suppress(Exception):
+            frozen.close()
+        api.request("PUT", "/api/settings", settings_now)
+        api.request("DELETE", "/api/channels/stall")
 
         # ---- teardown ----------------------------------------------------
         print("\nIdle teardown")

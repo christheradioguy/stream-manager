@@ -180,6 +180,12 @@ tracks it in Prometheus.
 
 Viewers stay connected throughout — they see a short stall, not a disconnect.
 
+Everything the source spawned is killed before reopening, including helpers that
+outlive their parent — streamlink's muxer, a shell pipeline's other half, a
+wrapper script's background job. A helper left running keeps the upstream
+connection open, so the reopen arrives as a *second* connection and a provider
+expecting one answers it with a reset.
+
 Better still, let the source tool ride out the rotation itself so no reopen is
 needed at all. For streamlink:
 
@@ -268,6 +274,24 @@ source and at 480p simultaneously still opens exactly one upstream connection.
 
 The **Active sessions** table in Settings shows this directly: a `source` row per
 channel, with its transcoders nested underneath.
+
+### Sources faster than real time
+
+An HLS input does not arrive at the rate the content plays. `ffmpeg -i <playlist>`
+downloads the whole segment backlog at line speed — a playlist holding 80 seconds
+of a 12 Mbit/s stream arrives in **bursts of 90 Mbit/s and more**. The player at
+the other end still consumes at 12 Mbit/s.
+
+That excess is held back rather than discarded: the source is paused, so its pipe
+fills, so the source process blocks, and the burst waits upstream where it costs
+nothing. The stream stays byte-exact. Discarding the excess instead is what
+produces glitching and macroblocking on exactly this kind of source, because
+bytes removed from the middle of a transport stream are lost frames.
+
+The hold is bounded by **Hold back a slow client for** (20s by default). A viewer
+still behind at that point is genuinely too slow rather than briefly outrun, and
+its oldest data is dropped so it cannot stall everyone else on the same source.
+Watch the session's **Dropped** column: it should be zero.
 
 ### When the encoder can't keep up
 
@@ -622,10 +646,11 @@ transcoder ended (exit code 8): Error opening output files: Encoder not found
 | `produced no data for Ns` | The command connected but never emitted anything — wrong URL, expired auth, or missing `-f mpegts pipe:1`. Use **Test source**. |
 | `ignored SIGTERM, killing` | The command traps or ignores SIGTERM. Harmless, but raise **Terminate grace** to let it exit cleanly. |
 | `encoder behind: N dropped` | The transcode can't run in real time on this CPU. Faster preset, lower resolution, or hardware encoding. |
+| Glitching or macroblocking on a high-bitrate source | Check the session's **Dropped** count. Anything above zero means data is being discarded rather than held back — raise **Hold back a slow client for**, and see *Sources faster than real time*. |
 | Rising continuity errors | Packet loss upstream. Check the network path to the provider; the worst-PID hint in the session row narrows it to video or audio. |
 | Rising transport errors | The source itself is marking packets corrupt — a bad tuner, aerial or upstream link, not something this server can fix. |
 | A source drops every few minutes and reconnects | Normal for live HLS behind a proxy or token: the window rotates and the source exits cleanly. See **Sources that rotate** below. |
-| `Connection reset by peer` right after a reopen | The upstream had not finished recycling. Raise **Reopen delay**, and prefer letting the source tool retry internally. |
+| `Connection reset by peer` right after a reopen | Usually a leftover helper still holding the old connection, so the new one looks like a second client. Fixed as of this version; if it persists, raise **Reopen delay** and prefer letting the source tool retry internally. |
 | Stream plays then dies after ~30s | Source stopped producing. Check the log; if the source is just slow, raise **Stall timeout**. |
 | `503 every source is blocked` | The channel's networks are at capacity or disabled. Check the Networks tab; raise the cap, or give the channel a source on another network. |
 | Client shows no guide | The tvg-id in the playlist must match a `<channel id>` in the XMLTV. Check the EPG tab's mapping table — anything showing **no guide** has no match. |

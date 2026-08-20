@@ -266,8 +266,10 @@ class EpgStore:
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=FETCH_TIMEOUT)
         except asyncio.TimeoutError as exc:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(os.getpgid(proc.pid), 9)
+            # proc.pid is the group id (start_new_session=True), and unlike
+            # os.getpgid() it still works once the child has been reaped.
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, 9)
             raise RuntimeError(f"command timed out after {FETCH_TIMEOUT}s") from exc
 
         if proc.returncode:

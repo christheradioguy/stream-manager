@@ -272,6 +272,10 @@ class Broadcaster:
         self.started_at: Optional[float] = None
         self.flowing_since: Optional[float] = None
 
+        # Drops are counted here as well as on the subscriber, because a client
+        # takes its own counter with it when it disconnects - which hid this
+        # entirely until a stream was sampled mid-flight.
+        self.dropped_total = 0
         self._subscribers: set[Subscriber] = set()
         self._prebuffer = bytearray()
         # True while the output is MPEG-TS, so replay can respect packet
@@ -460,10 +464,24 @@ class Broadcaster:
 
     def unsubscribe(self, sub: Subscriber) -> None:
         self._subscribers.discard(sub)
+        self.dropped_total += sub.dropped
+        sub.dropped = 0
         if not self._has_consumers():
             self._schedule_idle_stop()
 
-    def publish(self, chunk: bytes) -> None:
+    async def publish(self, chunk: bytes) -> None:
+        """Fan one chunk out, waiting for consumers that are briefly behind.
+
+        A source is often much faster than real time - an HLS input downloads its
+        whole segment backlog at line speed - while a player consumes at the rate
+        the content plays. Throwing away the excess corrupts the stream, so
+        instead this waits, which stops the pipe being drained, which makes the
+        source process block. The burst is then absorbed upstream where it costs
+        nothing, and no bytes are lost.
+
+        The wait is bounded: a consumer still full at the deadline is genuinely
+        too slow, and its oldest data is dropped so it cannot stall everyone else.
+        """
         self.bytes_out += len(chunk)
         if self._ts_output:
             before = self.analyser.counters
@@ -478,8 +496,42 @@ class Broadcaster:
             self.ledger.bytes_out += len(chunk)
         self._record_bitrate(len(chunk))
         self._push_prebuffer(chunk)
-        for sub in list(self._subscribers):
-            sub.put(chunk)
+        await self._deliver(chunk)
+
+    async def _deliver(self, chunk: bytes) -> None:
+        subscribers = list(self._subscribers)
+        if not subscribers:
+            return
+        wait = self.settings.backpressure_seconds
+        if wait <= 0:
+            for sub in subscribers:
+                self._put_counting(sub, chunk)
+            return
+        deadline = asyncio.get_running_loop().time() + wait
+        await asyncio.gather(
+            *(self._deliver_one(sub, chunk, deadline) for sub in subscribers)
+        )
+
+    async def _deliver_one(self, sub: Subscriber, chunk: bytes, deadline: float) -> None:
+        loop = asyncio.get_running_loop()
+        while sub.queue.full():
+            # Give up waiting on a consumer that has gone away, otherwise a
+            # client disconnecting on a full queue would stall the whole source.
+            if sub.closed or sub not in self._subscribers:
+                return
+            if loop.time() >= deadline:
+                break
+            await asyncio.sleep(0.02)
+        self._put_counting(sub, chunk)
+
+    def _put_counting(self, sub: Subscriber, chunk: bytes) -> None:
+        before = sub.dropped
+        sub.put(chunk)
+        if sub.dropped != before:
+            self.dropped_total += sub.dropped - before
+            sub.dropped = before
+            if self.ledger is not None:
+                self.ledger.dropped_chunks += 1
 
     async def attach(
         self, request_disconnected: Callable[[], Awaitable[bool]]
@@ -555,10 +607,19 @@ class Broadcaster:
     # -- process helpers ---------------------------------------------------
 
     async def _terminate(self, procs: list[asyncio.subprocess.Process]) -> None:
+        """Take down a pipeline and everything it spawned.
+
+        The group is signalled even when the direct child has already exited by
+        itself. Source commands fork helpers - streamlink spawning ffmpeg, a
+        shell pipeline, a wrapper script - and those helpers routinely outlive
+        their parent while still holding the upstream connection open. Reopening
+        the source then makes a *second* connection to a provider that only
+        expects one, which it answers with a reset.
+        """
         grace = self.settings.terminate_grace_seconds
         for proc in procs:
-            if proc.returncode is None:
-                self._signal_group(proc, signal.SIGTERM)
+            self._signal_group(proc, signal.SIGTERM)
+
         for proc in procs:
             if proc.returncode is None:
                 try:
@@ -571,17 +632,48 @@ class Broadcaster:
                 except ProcessLookupError:
                     pass
 
+        # Whatever is still standing in the group is an orphaned helper.
+        await self._reap_group(procs, grace)
+
+    async def _reap_group(
+        self, procs: list[asyncio.subprocess.Process], grace: float
+    ) -> None:
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            if not any(self._group_alive(p) for p in procs):
+                return
+            await asyncio.sleep(0.2)
+
+        for proc in procs:
+            if self._group_alive(proc):
+                log.info(
+                    "source %s left helper processes behind; killing group %s",
+                    self.key, proc.pid,
+                )
+                self._log("--- killed leftover child processes ---")
+                self._signal_group(proc, signal.SIGKILL)
+
+    @staticmethod
+    def _group_alive(proc: asyncio.subprocess.Process) -> bool:
+        try:
+            os.killpg(proc.pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError):
+            return False
+
     @staticmethod
     def _signal_group(proc: asyncio.subprocess.Process, sig: int) -> None:
         """Signal the whole process group.
 
-        Source commands routinely fork helpers (streamlink spawns ffmpeg); killing
-        only the direct child would leave those holding the upstream connection.
+        Spawning with start_new_session=True makes the child a session and group
+        leader, so its pid *is* the process group id. Using that directly rather
+        than os.getpgid() matters: getpgid fails once the child has been reaped,
+        which is precisely when its orphaned helpers still need killing.
         """
         try:
-            os.killpg(os.getpgid(proc.pid), sig)
+            os.killpg(proc.pid, sig)
         except (ProcessLookupError, PermissionError):
-            with contextlib.suppress(ProcessLookupError):
+            with contextlib.suppress(ProcessLookupError, ValueError):
                 proc.send_signal(sig)
 
     async def _reap(self, proc: asyncio.subprocess.Process) -> Optional[int]:
@@ -704,7 +796,7 @@ class Broadcaster:
             restarts=self.restarts,
             reconnects=self.reconnects,
             last_end=self.last_end,
-            dropped_chunks=sum(s.dropped for s in self._subscribers),
+            dropped_chunks=self.dropped_total + sum(s.dropped for s in self._subscribers),
             input_dropped=0,
             ts_packets=c.packets,
             ts_transport_errors=c.transport_errors,
@@ -926,7 +1018,7 @@ class SourceSession(Broadcaster):
             if not data:
                 continue
             self._mark_flowing()
-            self.publish(data)
+            await self.publish(data)
 
 
 # ---------------------------------------------------------------------------
@@ -1025,7 +1117,7 @@ class TranscodeSession(Broadcaster):
                 if not data:
                     continue
                 self._mark_flowing()
-                self.publish(data)
+                await self.publish(data)
         finally:
             self.source.unsubscribe(feed)
             self.input_dropped += feed.dropped

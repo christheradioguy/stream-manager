@@ -285,9 +285,16 @@ async def test_source(
                 with contextlib.suppress(OSError):
                     os.close(fd)
         for proc in (transcoder, source):
-            if proc is not None and proc.returncode is None:
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            if proc is None:
+                continue
+            # Signal the group even if the process has already exited: a source
+            # that forks a helper leaves it holding the upstream connection, and
+            # an audit over many sources would otherwise leak one per source.
+            # start_new_session=True makes the child its own group leader, so its
+            # pid is the group id and stays usable after it has been reaped.
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            if proc.returncode is None:
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(proc.wait(), timeout=2)
         with contextlib.suppress(OSError):

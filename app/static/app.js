@@ -1201,6 +1201,7 @@ function fillSettings() {
   $("#s-linger").value = s.linger_seconds;
   $("#s-prebuffer").value = (s.prebuffer_bytes / (1024 * 1024)).toFixed(1).replace(/\.0$/, "");
   $("#s-queue").value = s.client_queue_chunks;
+  $("#s-backpressure").value = s.backpressure_seconds;
   $("#s-startup").value = s.startup_timeout_seconds;
   $("#s-stall").value = s.stall_timeout_seconds;
   $("#s-reconnect").value = s.reconnect_delay_seconds;
@@ -1231,6 +1232,7 @@ $("#settings-form").addEventListener("submit", async (ev) => {
     linger_seconds: Number($("#s-linger").value),
     prebuffer_bytes: Math.round(Number($("#s-prebuffer").value) * 1024 * 1024),
     client_queue_chunks: Number($("#s-queue").value),
+    backpressure_seconds: Number($("#s-backpressure").value),
     startup_timeout_seconds: Number($("#s-startup").value),
     stall_timeout_seconds: Number($("#s-stall").value),
     reconnect_delay_seconds: Number($("#s-reconnect").value),
