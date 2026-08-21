@@ -30,7 +30,7 @@ from collections import deque
 from typing import AsyncIterator, Awaitable, Callable, Optional
 
 from .models import Channel, Network, Profile, SessionState, Settings, Source
-from .tsstats import LedgerEntry, TSAnalyser
+from .tsstats import NULL_PID, LedgerEntry, TSAnalyser
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +56,185 @@ TS_SYNC_SEARCH_LIMIT = 1024 * 1024
 # it. Past this the stream's keyframes are simply too far apart to buffer,
 # and it is trimmed by bytes like any other.
 PREBUFFER_GOP_SLACK = 4
+
+# MPEG-TS timestamps are 33-bit values ticking at 90 kHz, and wrap.
+TS_CLOCK = 1 << 33
+TS_HZ = 90000
+# Headroom left at a splice so the new run starts fractionally after the old
+# one ended rather than exactly on top of it.
+TIMELINE_GAP = TS_HZ // 10
+
+# The PES stream ids that have no optional header, and so never carry a
+# timestamp to rewrite: stream maps and directories, padding, ECM/EMM, DSM-CC.
+# Everything else does, and every one of those has to be shifted together.
+#
+# Getting this wrong is subtle and severe. AC-3 - the audio on most US
+# broadcast streams - travels as private_stream_1, id 0xBD, which sits below
+# the 0xC0 where audio ids are usually said to start. Rewriting video but not
+# that audio leaves the two on different timelines, a little further apart with
+# every restart, which is heard as the sound running steadily ahead of the
+# picture.
+NO_PES_HEADER = frozenset({0xBC, 0xBE, 0xBF, 0xF0, 0xF1, 0xF2, 0xF8, 0xFF})
+
+
+def _carries_timestamps(stream_id: int) -> bool:
+    return stream_id not in NO_PES_HEADER
+
+
+class TSRestamper:
+    """Holds one continuous timeline across source restarts.
+
+    Reopening a source starts a brand-new encoder run, whose timestamps begin
+    again from near zero. Splicing that into a client's stream rewinds its clock
+    by however long the previous run lasted, and players do not agree on what to
+    do about that: some resync, some freeze, some keep the old clock and play
+    audio and video at different offsets from then on. That last one is a sync
+    error that gets worse with every reconnect, and live sources reconnect
+    often - a rotating playlist window or token is a normal end, not a fault.
+
+    So each run's timestamps are shifted to carry on from where the last one
+    stopped. The client sees one timeline that only moves forwards and never
+    learns that the source restarted.
+    """
+
+    __slots__ = ("_offset", "_last", "_pending", "_cc_out", "_cc_shift")
+
+    def __init__(self) -> None:
+        self._offset = 0
+        self._last: Optional[int] = None   # highest stamp handed out so far
+        self._pending = False              # a new run needs an offset
+        # Continuity counters restart with the run too. A demuxer reads that as
+        # packet loss and resyncs, which is a glitch per reconnect and a burst
+        # of continuity errors against a stream that never actually lost
+        # anything. Each PID gets a shift that carries its counter on instead.
+        self._cc_out: dict[int, int] = {}
+        self._cc_shift: dict[int, int] = {}
+
+    def restart(self) -> None:
+        """The next run starts its clocks over; carry them on when they arrive."""
+        self._pending = True
+        self._cc_shift.clear()
+
+    def process(self, chunk: bytes) -> bytes:
+        """Put a buffer of whole, aligned packets onto the running timeline.
+
+        The first run keeps its own timestamps - there is nothing in front of it
+        to follow - but is still walked, because where it ends is where the next
+        run has to start.
+        """
+        buf = bytearray(chunk)
+        self.apply(buf)
+        return bytes(buf)
+
+    def apply(self, data: bytearray) -> None:
+        """Rewrite the timestamps in a buffer of whole, aligned packets."""
+        for offset in range(0, len(data) - TS_PACKET + 1, TS_PACKET):
+            byte3 = data[offset + 3]
+            pid = ((data[offset + 1] & 0x1F) << 8) | data[offset + 2]
+            if pid != NULL_PID:
+                byte3 = self._shift_counter(data, offset, byte3, pid)
+            payload = offset + 4
+            if byte3 & 0x20:
+                field = data[offset + 4]
+                payload += 1 + field
+                # PCR shares the timeline, so it has to move with the rest.
+                if field >= 7 and data[offset + 5] & 0x10:
+                    self._shift_pcr(data, offset + 6)
+            if not byte3 & 0x10 or not data[offset + 1] & 0x40:
+                continue
+            if byte3 & 0xC0:
+                continue  # scrambled: the PES header is ciphertext, not a header
+            if payload + 14 > offset + TS_PACKET:
+                continue
+            if data[payload:payload + 3] != b"\x00\x00\x01":
+                continue
+            if not _carries_timestamps(data[payload + 3]):
+                continue
+            flags = data[payload + 7]
+            if flags & 0x80:
+                self._shift_stamp(data, payload + 9, advance=True)
+            if flags & 0x40 and payload + 19 <= offset + TS_PACKET:
+                # The decode stamp moves by the same amount, or the two stop
+                # meaning the same thing.
+                self._shift_stamp(data, payload + 14, advance=False)
+
+    # -- the two encodings -------------------------------------------------
+
+    def _shift_stamp(self, data: bytearray, at: int, advance: bool) -> None:
+        raw = (((data[at] >> 1) & 0x07) << 30 | data[at + 1] << 22
+               | ((data[at + 2] >> 1) & 0x7F) << 15 | data[at + 3] << 7
+               | data[at + 4] >> 1)
+        value = self._rebase(raw)
+        if advance:
+            self._advance(value)
+        data[at] = (data[at] & 0xF0) | ((value >> 29) & 0x0E) | 0x01
+        data[at + 1] = (value >> 22) & 0xFF
+        data[at + 2] = ((value >> 14) & 0xFE) | 0x01
+        data[at + 3] = (value >> 7) & 0xFF
+        data[at + 4] = ((value << 1) & 0xFE) | 0x01
+
+    def _shift_pcr(self, data: bytearray, at: int) -> None:
+        base = (data[at] << 25 | data[at + 1] << 17 | data[at + 2] << 9
+                | data[at + 3] << 1 | data[at + 4] >> 7)
+        value = self._rebase(base)
+        data[at] = (value >> 25) & 0xFF
+        data[at + 1] = (value >> 17) & 0xFF
+        data[at + 2] = (value >> 9) & 0xFF
+        data[at + 3] = (value >> 1) & 0xFF
+        data[at + 4] = ((value << 7) & 0x80) | (data[at + 4] & 0x7F)
+
+    def _shift_counter(self, data: bytearray, offset: int, byte3: int, pid: int) -> int:
+        """Continue this PID's continuity counter across a restart."""
+        counter = byte3 & 0x0F
+        shift = self._cc_shift.get(pid)
+        if shift is None:
+            previous = self._cc_out.get(pid)
+            # Only a PID the client has already been watching needs to be
+            # carried on; one appearing for the first time starts where it likes.
+            # A packet with no payload does not advance the counter, so it has to
+            # repeat the last one rather than follow it.
+            if previous is None:
+                shift = 0
+            elif byte3 & 0x10:
+                shift = (previous + 1 - counter) & 0x0F
+            else:
+                shift = (previous - counter) & 0x0F
+            self._cc_shift[pid] = shift
+        if shift:
+            counter = (counter + shift) & 0x0F
+            byte3 = (byte3 & 0xF0) | counter
+            data[offset + 3] = byte3
+        self._cc_out[pid] = counter
+        return byte3
+
+    # -- the timeline ------------------------------------------------------
+
+    def _rebase(self, raw: int) -> int:
+        if self._pending:
+            # First stamp of a new run: line it up just past the last one the
+            # client saw. On the very first run there is nothing to follow, so
+            # the stream keeps its own timestamps.
+            self._pending = False
+            if self._last is None:
+                self._offset = 0
+            else:
+                self._offset = (self._last + TIMELINE_GAP - raw) % TS_CLOCK
+        return (raw + self._offset) % TS_CLOCK
+
+    def _advance(self, value: int) -> None:
+        """Remember the furthest stamp handed out, which is where a restart resumes.
+
+        This has to track what was actually emitted rather than a filtered view
+        of it, or the next restart rebases onto a timestamp the client never saw
+        and rewinds anyway. Only backward steps are ignored - a stream that
+        reorders slightly within a run must not drag the resume point back.
+        """
+        if self._last is None:
+            self._last = value
+            return
+        if 0 < (value - self._last) % TS_CLOCK < TS_CLOCK // 2:
+            self._last = value
+
 
 # Stream types the PMT uses for video. A consumer has to be started on a video
 # keyframe, so we have to know which PID carries the video.
@@ -410,6 +589,9 @@ class Broadcaster:
         self._start_points = TSStartPoints()
         self._prebuffer_raps: list[int] = []
         self._prebuffer_pats: list[int] = []
+        # Holds one timeline across restarts, so a reconnect does not rewind
+        # every watching client's clock.
+        self._restamper = TSRestamper()
         # True while the output is MPEG-TS, so replay can respect packet
         # boundaries. Cleared for profiles that mux to something else.
         self._ts_output = True
@@ -455,6 +637,9 @@ class Broadcaster:
         while not self._stopping:
             self.status = "starting"
             self.flowing_since = None
+            # Whatever this attempt produces, its timestamps start over. Rebase
+            # them onto the timeline clients are already watching.
+            self._restamper.restart()
             attempt_started = time.monotonic()
             fatal = False
             failure: Optional[StreamFailure] = None
@@ -619,6 +804,10 @@ class Broadcaster:
         The wait is bounded: a consumer still full at the deadline is genuinely
         too slow, and its oldest data is dropped so it cannot stall everyone else.
         """
+        if self._ts_output:
+            # Do this first: the prebuffer, the analyser and every consumer must
+            # all see the same timeline the client is going to be given.
+            chunk = self._restamper.process(chunk)
         self.bytes_out += len(chunk)
         if self._ts_output:
             before = self.analyser.counters

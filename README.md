@@ -39,6 +39,10 @@ concurrent streams and refuse the second one.
   and serves `/xmltv.xml` with ids rewritten to match the playlist.
 - **One upstream connection per channel** — however many viewers, whatever mix
   of profiles. Transcoders are consumers of the shared source, not extra tuners.
+- **One continuous timeline** — a source that reopens does not rewind the clock of
+  anyone watching. Timestamps and continuity counters are carried across the
+  restart, so a routine playlist or token rotation is invisible to the player
+  instead of pushing audio and video further apart each time.
 - **Keyframe-aligned handover** — clients always start on a 188-byte TS boundary,
   and one joining a running channel starts on a video keyframe with the program
   tables in front of it. Starting mid-GOP is what leaves a player's audio running
@@ -179,7 +183,24 @@ reconnecting so the upstream has a moment to be ready. The session row shows a
 **Reopens** count separately from restarts, and `streams_manager_reconnects_total`
 tracks it in Prometheus.
 
-Viewers stay connected throughout — they see a short stall, not a disconnect.
+Viewers stay connected throughout — they see a short stall, not a disconnect —
+and the reopen is made invisible to them. A new run is a new encoder: its
+timestamps start again from zero and so do its continuity counters. Spliced into
+a live viewer's stream as-is, that rewinds the player's clock by however long the
+previous run lasted, and looks like a burst of packet loss on top. Players do not
+agree on what to do about either — the common answer is to keep the old clock and
+present audio and video at different offsets from then on, so lip sync drifts a
+little further with every reopen. Instead each run's timestamps and counters are
+carried on from where the last one stopped, and the client sees one timeline that
+only ever moves forwards.
+
+Both tracks are moved together, which is less obvious than it sounds. AC-3 —
+the audio on most US broadcast sources — travels as `private_stream_1`, stream
+id `0xBD`, below the range audio ids are usually said to occupy. Rebasing the
+video and not that leaves the two on separate timelines, one run's length
+further apart at every reopen, heard as the sound pulling steadily ahead of the
+picture. `tools/avdrift.py` measures the gap on any stream if you want to check
+one.
 
 Everything the source spawned is killed before reopening, including helpers that
 outlive their parent — streamlink's muxer, a shell pipeline's other half, a
@@ -417,6 +438,26 @@ lag badly.
 | **Give up after N failures** | Stop retrying a source that keeps failing. 0 keeps trying forever. A transcode profile that dies without ever emitting a frame is treated as broken and abandoned after three tries regardless. |
 | **Terminate grace** | How long a process gets to exit on SIGTERM before it is killed. Raise it if you see `ignored SIGTERM, killing` in the log. |
 | **Default max clients** | Viewer cap per channel, counted across all profiles. 0 = unlimited. |
+
+## Checking lip sync on a channel
+
+Audio and video are two streams of the same programme, so they should arrive in
+equal amounts. When they don't, one of them is losing content and the gap is
+what a viewer hears as bad lip sync. `tools/avdrift.py` measures that gap, in
+slices, so you can see whether it is a fixed offset or one that keeps growing:
+
+```bash
+tools/avdrift.py http://localhost:8409/stream/bbc1 300          # through here
+tools/avdrift.py --command 'ffmpeg -i URL -c copy -f mpegts pipe:1' 300
+tools/avdrift.py /tmp/capture.ts                                # a saved file
+tools/avdrift.py http://localhost:8409/stream/bbc1 300 --keep /tmp/c.ts
+```
+
+Run it both ways on the same channel. If only the first drifts, this server is
+doing it. If both do, the stream arrives that way and the fix belongs in the
+source arguments. `--keep` saves the capture and also asks a decoder what it
+makes of it — if the decoder disagrees with the timestamp arithmetic, the tool
+says so rather than reporting a confident wrong number.
 
 ## Auditing every source
 
@@ -658,6 +699,8 @@ transcoder ended (exit code 8): Error opening output files: Encoder not found
 | Rising continuity errors | Packet loss upstream. Check the network path to the provider; the worst-PID hint in the session row narrows it to video or audio. |
 | Rising transport errors | The source itself is marking packets corrupt — a bad tuner, aerial or upstream link, not something this server can fix. |
 | A source drops every few minutes and reconnects | Normal for live HLS behind a proxy or token: the window rotates and the source exits cleanly. See **Sources that rotate** below. |
+| Lip sync drifts further the longer a channel is left on | Was a source reopening: each new run restarted its timestamps and the viewer's clock was rewound with them, a little more out of sync every time. Fixed as of this version. Check the session's **Reopens** count — if it is climbing, that was it. |
+| Audio steadily running ahead of the picture | Same cause, worst on AC-3 sources — most US broadcast channels. AC-3 travels as `private_stream_1`, below where audio stream ids are usually assumed to start, so it was being left behind when the video was put back on the timeline: one run's length further ahead every reopen. Fixed as of this version. `tools/avdrift.py` measures it if you want to confirm. |
 | `Connection reset by peer` right after a reopen | Usually a leftover helper still holding the old connection, so the new one looks like a second client. Fixed as of this version; if it persists, raise **Reopen delay** and prefer letting the source tool retry internally. |
 | Stream plays then dies after ~30s | Source stopped producing. Check the log; if the source is just slow, raise **Stall timeout**. |
 | `503 every source is blocked` | The channel's networks are at capacity or disabled. Check the Networks tab; raise the cap, or give the channel a source on another network. |

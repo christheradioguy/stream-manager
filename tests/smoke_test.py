@@ -314,7 +314,12 @@ def stream_status(url: str, timeout: float = 15.0) -> tuple[int, str]:
 
 def hold_stream(url: str, seconds: float) -> int:
     """Stay attached to a stream for a while and return the bytes received."""
-    total = 0
+    return len(hold_capture(url, seconds))
+
+
+def hold_capture(url: str, seconds: float) -> bytes:
+    """Stay attached to a stream for a while and keep what it sent."""
+    out: list[bytes] = []
     deadline = time.time() + seconds
     try:
         with urllib.request.urlopen(url, timeout=seconds + 15) as resp:
@@ -322,10 +327,10 @@ def hold_stream(url: str, seconds: float) -> int:
                 chunk = resp.read(16 * 1024)
                 if not chunk:
                     break
-                total += len(chunk)
+                out.append(chunk)
     except Exception as exc:  # noqa: BLE001 - reported by the caller
         print(f"    (hold ended: {exc})")
-    return total
+    return b"".join(out)
 
 
 TS_PACKET = 188
@@ -355,6 +360,83 @@ def starts_at_pat(data: bytes) -> bool:
     if len(data) < TS_PACKET or data[0] != 0x47:
         return False
     return (((data[1] & 0x1F) << 8) | data[2]) == 0
+
+
+def timeline_rewinds(data: bytes) -> list[tuple[float, float]]:
+    """Points where the timestamps a client is given jump backwards.
+
+    Reopening a source starts a new encoder run whose timestamps begin again
+    from zero. Splicing that into a live viewer's stream rewinds its clock,
+    which players resolve in their own contradictory ways - the common one being
+    to carry the old clock forward and drift audio away from video, a little
+    further on every reconnect.
+    """
+    video = busiest_pid(data)
+    rewinds: list[tuple[float, float]] = []
+    last = None
+    for offset in range(0, len(data) - TS_PACKET + 1, TS_PACKET):
+        if data[offset] != 0x47:
+            continue
+        if (((data[offset + 1] & 0x1F) << 8) | data[offset + 2]) != video:
+            continue
+        pts = packet_pts(data, offset)
+        if pts is None:
+            continue
+        if last is not None and pts < last - 0.5:
+            rewinds.append((round(last, 3), round(pts, 3)))
+        last = pts
+    return rewinds
+
+
+def track_separation(data: bytes) -> float | None:
+    """How far the two busiest streams' timelines move apart over a capture.
+
+    Both carry the same programme, so the gap between their timestamps should
+    stay put. A gap that grows means one of them is being put on a different
+    timeline from the other.
+    """
+    counts: dict[int, int] = {}
+    for offset in range(0, len(data) - TS_PACKET + 1, TS_PACKET):
+        if data[offset] != 0x47:
+            continue
+        pid = ((data[offset + 1] & 0x1F) << 8) | data[offset + 2]
+        if pid != 0x1FFF:
+            counts[pid] = counts.get(pid, 0) + 1
+    stamps: dict[int, list[tuple[int, float]]] = {}
+    for offset in range(0, len(data) - TS_PACKET + 1, TS_PACKET):
+        if data[offset] != 0x47:
+            continue
+        pid = ((data[offset + 1] & 0x1F) << 8) | data[offset + 2]
+        pts = packet_pts(data, offset)
+        if pts is not None:
+            stamps.setdefault(pid, []).append((offset, pts))
+    ranked = [p for p in sorted(counts, key=counts.__getitem__, reverse=True)
+              if len(stamps.get(p, ())) > 5][:2]
+    if len(ranked) < 2:
+        return None
+    first, second = stamps[ranked[0]], stamps[ranked[1]]
+    gaps, j = [], 0
+    for offset, pts in first:
+        while j + 1 < len(second) and second[j + 1][0] <= offset:
+            j += 1
+        gaps.append(second[j][1] - pts)
+    return max(gaps) - min(gaps) if gaps else None
+
+
+def packet_pts(data: bytes, offset: int) -> float | None:
+    """The PTS in a TS packet that starts a PES, if it carries one."""
+    byte3 = data[offset + 3]
+    if not byte3 & 0x10 or not data[offset + 1] & 0x40:
+        return None
+    at = offset + 4 + (1 + data[offset + 4] if byte3 & 0x20 else 0)
+    if at + 14 > offset + TS_PACKET or data[at:at + 3] != b"\x00\x00\x01":
+        return None
+    if not data[at + 7] & 0x80:
+        return None
+    b = data[at + 9:at + 14]
+    ticks = ((((b[0] >> 1) & 0x07) << 30) | (b[1] << 22)
+             | (((b[2] >> 1) & 0x7F) << 15) | (b[3] << 7) | (b[4] >> 1))
+    return ticks / 90000.0
 
 
 def busiest_pid(data: bytes) -> int:
@@ -1178,6 +1260,43 @@ def main() -> int:
         api.request("DELETE", "/api/channels/aud2")
         api.request("DELETE", "/api/networks/auditnet")
 
+        # ---- AC-3 audio across a reopen -----------------------------------
+        # AC-3 travels as private_stream_1, id 0xBD, below the range audio ids
+        # are usually assumed to start at. A reopen that rebases the video's
+        # timestamps but not that audio's leaves the two on separate timelines,
+        # further apart every time, which is heard as sound running ahead of
+        # picture. Most US broadcast sources are AC-3, so this is the common
+        # case, not an exotic one.
+        print("\nAC-3 audio across a reopen")
+        ac3 = tmpdir / "ac3.sh"
+        ac3.write_text(
+            "#!/bin/sh\n"
+            "exec ffmpeg -hide_banner -loglevel error -re "
+            "-f lavfi -i testsrc2=size=320x180:rate=15 "
+            "-f lavfi -i sine=frequency=440:sample_rate=48000 -t 12 "
+            "-c:v mpeg2video -b:v 800k -g 15 -c:a ac3 -b:a 128k -ac 2 "
+            "-f mpegts pipe:1\n"
+        )
+        ac3.chmod(0o755)
+        settings_now = api.request("GET", "/api/settings")[1]
+        api.request("PUT", "/api/settings", {**settings_now, "reconnect_delay_seconds": 1})
+        api.request("POST", "/api/channels", {
+            "id": "ac3", "name": "AC-3", "enabled": True,
+            "sources": [{"id": "s1", "name": "AC-3", "command": f"sh {ac3}"}],
+        })
+        heard = hold_capture(f"{base}/stream/ac3", 30)   # spans two reopens
+        check("AC-3 channel delivers data", len(heard) > 100_000, f"{len(heard)} bytes")
+        apart = track_separation(heard)
+        # Splicing two encoder runs shifts how the tracks interleave by a
+        # fraction of a second either way, so a little movement is normal. The
+        # fault this guards against moves them apart by a whole run every
+        # reopen, so there is a wide gap between the two.
+        check("AC-3 stays on the same timeline as the video across a reopen",
+              apart is not None and apart < 2.0,
+              f"tracks drift {apart if apart is None else round(apart, 2)}s apart")
+        api.request("PUT", "/api/settings", settings_now)
+        api.request("DELETE", "/api/channels/ac3")
+
         # ---- rotating source (streams, ends cleanly, must reopen politely) ----
         # Reproduces a live HLS source whose token or playlist window rotates:
         # it streams fine, exits 0, and must be reopened after a settle pause
@@ -1204,9 +1323,21 @@ def main() -> int:
         })
 
         # Hold a viewer across at least one rotation.
-        held = hold_stream(f"{base}/stream/rot", 34)
+        seen = hold_capture(f"{base}/stream/rot", 34)
+        held = len(seen)
         check("viewer keeps receiving data across a rotation", held > 100_000,
               f"{held} bytes")
+
+        # The viewer must not be able to tell that the source restarted. A new
+        # run's timestamps and continuity counters both begin again, and handing
+        # either of those to a player mid-stream is what turns a routine reopen
+        # into drifting lip sync and phantom packet loss.
+        rewinds = timeline_rewinds(seen)
+        check("a reopen does not rewind the viewer's clock", not rewinds,
+              f"{len(rewinds)} rewind(s), first {rewinds[0] if rewinds else '-'}")
+        check("a reopen does not look like packet loss to the viewer",
+              ts_continuity_errors(seen) == 0,
+              f"continuity errors={ts_continuity_errors(seen)}")
 
         status, sessions = api.request("GET", "/api/sessions")
         rot = next((s for s in sessions if s["channel_id"] == "rot"), None)
