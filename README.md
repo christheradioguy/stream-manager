@@ -194,6 +194,14 @@ little further with every reopen. Instead each run's timestamps and counters are
 carried on from where the last one stopped, and the client sees one timeline that
 only ever moves forwards.
 
+The stream's clock references move with them, and resume from where the clock
+got to rather than from where the presentation stamps got to. Those two are not
+the same place — a clock reference sits behind the picture it times by however
+much the decoder is expected to buffer, often the better part of a second — and
+resuming the clock from the wrong one leaves a gap in it at every reopen.
+Players that decode by presentation stamp never notice; players that pace from
+the clock, which is most set-top and Android ones, run slow and fall behind.
+
 Both tracks are moved together, which is less obvious than it sounds. AC-3 —
 the audio on most US broadcast sources — travels as `private_stream_1`, stream
 id `0xBD`, below the range audio ids are usually said to occupy. Rebasing the
@@ -459,6 +467,22 @@ source arguments. `--keep` saves the capture and also asks a decoder what it
 makes of it — if the decoder disagrees with the timestamp arithmetic, the tool
 says so rather than reporting a confident wrong number.
 
+### When it plays on a computer but not on a television
+
+The two follow different clocks. Desktop players decode by presentation stamp;
+set-top and Android players pace from the stream's program clock reference. A
+fault in the latter is invisible on one and crippling on the other — video that
+runs slow and falls further behind, on a stream that looks perfect in ffplay.
+`tools/tsclock.py` checks the clock rather than the picture:
+
+```bash
+tools/tsclock.py /tmp/capture.ts
+tools/tsclock.py direct.ts via-manager.ts     # compare against the source
+```
+
+Capture from the source on its own as well and compare the two. The source is
+the reference; anything this server adds is its own fault.
+
 ## Auditing every source
 
 Checking that all your sources still work, the way you would loop over
@@ -700,6 +724,7 @@ transcoder ended (exit code 8): Error opening output files: Encoder not found
 | Rising transport errors | The source itself is marking packets corrupt — a bad tuner, aerial or upstream link, not something this server can fix. |
 | A source drops every few minutes and reconnects | Normal for live HLS behind a proxy or token: the window rotates and the source exits cleanly. See **Sources that rotate** below. |
 | Lip sync drifts further the longer a channel is left on | Was a source reopening: each new run restarted its timestamps and the viewer's clock was rewound with them, a little more out of sync every time. Fixed as of this version. Check the session's **Reopens** count — if it is climbing, that was it. |
+| Plays fine on a computer but slow and stuttering on a set-top or Android client | The two disagree about which clock to follow: desktop players decode by presentation stamp, set-top ones pace from the stream's clock references. A fault in the latter is invisible on one and crippling on the other. Fixed as of this version — a reopen used to leave a gap in the clock. |
 | Audio steadily running ahead of the picture | Same cause, worst on AC-3 sources — most US broadcast channels. AC-3 travels as `private_stream_1`, below where audio stream ids are usually assumed to start, so it was being left behind when the video was put back on the timeline: one run's length further ahead every reopen. Fixed as of this version. `tools/avdrift.py` measures it if you want to confirm. |
 | `Connection reset by peer` right after a reopen | Usually a leftover helper still holding the old connection, so the new one looks like a second client. Fixed as of this version; if it persists, raise **Reopen delay** and prefer letting the source tool retry internally. |
 | Stream plays then dies after ~30s | Source stopped producing. Check the log; if the source is just slow, raise **Stall timeout**. |

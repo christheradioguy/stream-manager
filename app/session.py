@@ -60,9 +60,11 @@ PREBUFFER_GOP_SLACK = 4
 # MPEG-TS timestamps are 33-bit values ticking at 90 kHz, and wrap.
 TS_CLOCK = 1 << 33
 TS_HZ = 90000
-# Headroom left at a splice so the new run starts fractionally after the old
-# one ended rather than exactly on top of it.
-TIMELINE_GAP = TS_HZ // 10
+# Headroom left at a splice so the new run starts fractionally after the old one
+# ended rather than exactly on top of it. It has to stay well inside the 100 ms
+# a decoder is entitled to expect between clock references, or the splice itself
+# becomes a gap in the clock.
+TIMELINE_GAP = TS_HZ // 50
 
 # The PES stream ids that have no optional header, and so never carry a
 # timestamp to rewrite: stream maps and directories, padding, ECM/EMM, DSM-CC.
@@ -101,7 +103,12 @@ class TSRestamper:
 
     def __init__(self) -> None:
         self._offset = 0
-        self._last: Optional[int] = None   # highest stamp handed out so far
+        # The furthest stamp handed out, kept per kind. A stream's clock
+        # references run behind its presentation stamps by however much the
+        # decoder is expected to buffer - a second is normal. Resuming the clock
+        # from where the presentation stamps got to would jump it forward by
+        # that much at every restart, so each kind has to resume from its own.
+        self._last: dict[str, int] = {}
         self._pending = False              # a new run needs an offset
         # Continuity counters restart with the run too. A demuxer reads that as
         # packet loss and resyncs, which is a glitch per reconnect and a burst
@@ -164,9 +171,9 @@ class TSRestamper:
         raw = (((data[at] >> 1) & 0x07) << 30 | data[at + 1] << 22
                | ((data[at + 2] >> 1) & 0x7F) << 15 | data[at + 3] << 7
                | data[at + 4] >> 1)
-        value = self._rebase(raw)
+        value = self._rebase(raw, "pts")
         if advance:
-            self._advance(value)
+            self._advance(value, "pts")
         data[at] = (data[at] & 0xF0) | ((value >> 29) & 0x0E) | 0x01
         data[at + 1] = (value >> 22) & 0xFF
         data[at + 2] = ((value >> 14) & 0xFE) | 0x01
@@ -176,7 +183,8 @@ class TSRestamper:
     def _shift_pcr(self, data: bytearray, at: int) -> None:
         base = (data[at] << 25 | data[at + 1] << 17 | data[at + 2] << 9
                 | data[at + 3] << 1 | data[at + 4] >> 7)
-        value = self._rebase(base)
+        value = self._rebase(base, "pcr")
+        self._advance(value, "pcr")
         data[at] = (value >> 25) & 0xFF
         data[at + 1] = (value >> 17) & 0xFF
         data[at + 2] = (value >> 9) & 0xFF
@@ -209,31 +217,30 @@ class TSRestamper:
 
     # -- the timeline ------------------------------------------------------
 
-    def _rebase(self, raw: int) -> int:
+    def _rebase(self, raw: int, kind: str) -> int:
         if self._pending:
-            # First stamp of a new run: line it up just past the last one the
-            # client saw. On the very first run there is nothing to follow, so
-            # the stream keeps its own timestamps.
+            # First stamp of a new run: line it up just past the last one of its
+            # own kind that the client saw. On the very first run there is
+            # nothing to follow, so the stream keeps its own timestamps.
             self._pending = False
-            if self._last is None:
+            reference = self._last.get(kind)
+            if reference is None:
                 self._offset = 0
             else:
-                self._offset = (self._last + TIMELINE_GAP - raw) % TS_CLOCK
+                self._offset = (reference + TIMELINE_GAP - raw) % TS_CLOCK
         return (raw + self._offset) % TS_CLOCK
 
-    def _advance(self, value: int) -> None:
-        """Remember the furthest stamp handed out, which is where a restart resumes.
+    def _advance(self, value: int, kind: str) -> None:
+        """Remember the furthest stamp of each kind handed out, where a restart resumes.
 
         This has to track what was actually emitted rather than a filtered view
         of it, or the next restart rebases onto a timestamp the client never saw
         and rewinds anyway. Only backward steps are ignored - a stream that
         reorders slightly within a run must not drag the resume point back.
         """
-        if self._last is None:
-            self._last = value
-            return
-        if 0 < (value - self._last) % TS_CLOCK < TS_CLOCK // 2:
-            self._last = value
+        previous = self._last.get(kind)
+        if previous is None or 0 < (value - previous) % TS_CLOCK < TS_CLOCK // 2:
+            self._last[kind] = value
 
 
 # Stream types the PMT uses for video. A consumer has to be started on a video

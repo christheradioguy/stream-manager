@@ -423,6 +423,33 @@ def track_separation(data: bytes) -> float | None:
     return max(gaps) - min(gaps) if gaps else None
 
 
+def pcr_gap(data: bytes) -> float | None:
+    """The longest run without a clock reference, in seconds.
+
+    A decoder is entitled to a program clock reference at least every 100 ms.
+    Players that pace playback from it - set-top and Android ones especially -
+    stall or run slow when the clock stops, even though a desktop player
+    decoding by presentation stamps alone never notices.
+    """
+    seen: dict[int, list[float]] = {}
+    for offset in range(0, len(data) - TS_PACKET + 1, TS_PACKET):
+        if data[offset] != 0x47 or not data[offset + 3] & 0x20:
+            continue
+        if data[offset + 4] < 7 or not data[offset + 5] & 0x10:
+            continue
+        pid = ((data[offset + 1] & 0x1F) << 8) | data[offset + 2]
+        a = offset + 6
+        base = (data[a] << 25 | data[a + 1] << 17 | data[a + 2] << 9
+                | data[a + 3] << 1 | data[a + 4] >> 7)
+        seen.setdefault(pid, []).append(base / 90000.0)
+    if not seen:
+        return None
+    stamps = max(seen.values(), key=len)
+    if len(stamps) < 2:
+        return None
+    return max((b - a) for a, b in zip(stamps, stamps[1:]) if b >= a)
+
+
 def packet_pts(data: bytes, offset: int) -> float | None:
     """The PTS in a TS packet that starts a PES, if it carries one."""
     byte3 = data[offset + 3]
@@ -1294,6 +1321,11 @@ def main() -> int:
         check("AC-3 stays on the same timeline as the video across a reopen",
               apart is not None and apart < 2.0,
               f"tracks drift {apart if apart is None else round(apart, 2)}s apart")
+        gap = pcr_gap(heard)
+        check("the clock keeps ticking across a reopen",
+              gap is not None and gap < 0.1,
+              f"longest gap without a clock reference: "
+              f"{'none found' if gap is None else format(gap, '.3f') + 's'}")
         api.request("PUT", "/api/settings", settings_now)
         api.request("DELETE", "/api/channels/ac3")
 
