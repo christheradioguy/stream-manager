@@ -357,6 +357,39 @@ def starts_at_pat(data: bytes) -> bool:
     return (((data[1] & 0x1F) << 8) | data[2]) == 0
 
 
+def busiest_pid(data: bytes) -> int:
+    """The PID carrying most of the bytes, which in practice is the video."""
+    counts: dict[int, int] = {}
+    for offset in range(0, len(data) - TS_PACKET + 1, TS_PACKET):
+        pid = ((data[offset + 1] & 0x1F) << 8) | data[offset + 2]
+        if pid != 0x1FFF:
+            counts[pid] = counts.get(pid, 0) + 1
+    return max(counts, key=counts.__getitem__) if counts else -1
+
+
+def starts_on_keyframe(data: bytes) -> bool:
+    """The first video packet must be one a decoder can start on.
+
+    Handing a viewer the middle of a GOP gives it audio it can decode and video
+    it cannot. Players that start their clock on the first thing they decode
+    then run the sound ahead of the picture by however far into the GOP the
+    handover happened, for the rest of the session.
+    """
+    video = busiest_pid(data)
+    for offset in range(0, len(data) - TS_PACKET + 1, TS_PACKET):
+        if data[offset] != 0x47:
+            return False
+        if (((data[offset + 1] & 0x1F) << 8) | data[offset + 2]) != video:
+            continue
+        return bool(
+            data[offset + 1] & 0x40                 # starts a payload unit
+            and data[offset + 3] & 0x20             # has an adaptation field
+            and data[offset + 4]                    # which is not empty
+            and data[offset + 5] & 0x40             # and flags random access
+        )
+    return False
+
+
 def main() -> int:
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
@@ -566,12 +599,25 @@ def main() -> int:
               f"sync offset={sync_offset(data)}")
 
         # A client joining an already-running session gets the prebuffer replayed.
-        # That replay must also be packet-aligned and lead with a PAT.
+        # That replay must be packet-aligned, lead with a PAT, and open on a
+        # keyframe - starting it mid-GOP is what leaves a player's audio running
+        # ahead of its picture for the rest of the session.
         joiner = read_stream(f"{base}/stream/testcard", 188 * 400)
         check("mid-stream joiner starts on a packet boundary", is_aligned(joiner),
               f"sync offset={sync_offset(joiner)}")
         check("mid-stream joiner starts at a PAT", starts_at_pat(joiner),
               f"first packet pid={((joiner[1] & 0x1F) << 8 | joiner[2]) if len(joiner) > 2 else '-'}")
+        check("mid-stream joiner's first video packet is a keyframe",
+              starts_on_keyframe(joiner), f"video pid={busiest_pid(joiner)}")
+
+        # And again with nothing to replay: the joiner has to be held until the
+        # stream reaches its next keyframe rather than started wherever it is.
+        status, before = api.request("GET", "/api/settings")
+        api.request("PUT", "/api/settings", {**before, "prebuffer_bytes": 0})
+        bare = read_stream(f"{base}/stream/testcard", 188 * 400)
+        check("joiner with no prebuffer still starts on a keyframe",
+              starts_on_keyframe(bare), f"video pid={busiest_pid(bare)}")
+        api.request("PUT", "/api/settings", before)
 
         status, sessions = api.request("GET", "/api/sessions")
         running = [s for s in sessions if s["channel_id"] == "testcard"]

@@ -25,6 +25,7 @@ import os
 import shlex
 import signal
 import time
+from bisect import bisect_left, bisect_right
 from collections import deque
 from typing import AsyncIterator, Awaitable, Callable, Optional
 
@@ -50,6 +51,129 @@ TS_SYNC = 0x47
 # Give up on finding TS sync after this much data and pass bytes through raw,
 # so a source that is not actually MPEG-TS still works.
 TS_SYNC_SEARCH_LIMIT = 1024 * 1024
+
+# How far the prebuffer may overshoot its byte limit to keep a whole GOP in
+# it. Past this the stream's keyframes are simply too far apart to buffer,
+# and it is trimmed by bytes like any other.
+PREBUFFER_GOP_SLACK = 4
+
+# Stream types the PMT uses for video. A consumer has to be started on a video
+# keyframe, so we have to know which PID carries the video.
+VIDEO_STREAM_TYPES = frozenset({
+    0x01,  # MPEG-1 video
+    0x02,  # MPEG-2 video
+    0x10,  # MPEG-4 part 2
+    0x1B,  # H.264
+    0x24,  # HEVC
+    0x33,  # VVC
+    0x42,  # AVS
+    0xD1,  # Dirac
+    0xEA,  # VC-1
+})
+
+
+class TSStartPoints:
+    """Finds the places in a transport stream where a consumer may be started.
+
+    Handing a viewer bytes from the middle of a GOP looks like it works: the
+    demuxer syncs, the audio decodes immediately, and the picture appears a
+    moment later at the next keyframe. What actually happened is that the player
+    started its clock on the first thing it could decode - the audio - and every
+    frame after that is presented late by however far into the GOP we happened to
+    join. Up to a full keyframe interval, and it never corrects itself.
+
+    So a joining consumer is started at a *random access point* instead: a video
+    packet whose adaptation field sets random_access_indicator. Finding those
+    needs the video PID, which needs the PMT, which needs the PAT - all of which
+    this learns as the stream goes past.
+
+    Streams whose muxer does not flag random access points leave ``marks_raps``
+    false, and callers fall back to their previous behaviour rather than waiting
+    for a keyframe that will never be announced.
+    """
+
+    __slots__ = ("_pmt_pid", "_video_pids", "marks_raps")
+
+    def __init__(self) -> None:
+        self._pmt_pid: Optional[int] = None
+        self._video_pids: frozenset[int] = frozenset()
+        self.marks_raps = False
+
+    def scan(self, data: bytes) -> tuple[list[int], list[int]]:
+        """Offsets of the PATs and the random access points in aligned packets."""
+        pats: list[int] = []
+        raps: list[int] = []
+        for offset in range(0, len(data) - TS_PACKET + 1, TS_PACKET):
+            byte1 = data[offset + 1]
+            pid = ((byte1 & 0x1F) << 8) | data[offset + 2]
+            unit_start = byte1 & 0x40
+            if pid == 0:
+                if unit_start:
+                    pats.append(offset)
+                    self._read_pat(data, offset)
+                continue
+            if pid == self._pmt_pid:
+                if unit_start:
+                    self._read_pmt(data, offset)
+                continue
+            if unit_start and pid in self._video_pids:
+                byte3 = data[offset + 3]
+                # An adaptation field must be present, non-empty, and flag this
+                # packet as a point the decoder can be started from.
+                if (byte3 & 0x20) and data[offset + 4] and (data[offset + 5] & 0x40):
+                    raps.append(offset)
+                    self.marks_raps = True
+        return pats, raps
+
+    # -- section parsing ---------------------------------------------------
+    #
+    # Only sections that fit in their first packet are read, which is all a PAT
+    # or a single-program PMT ever needs. Anything longer simply leaves the
+    # tables unlearned, and the caller degrades to not aligning on keyframes.
+
+    @staticmethod
+    def _section(data: bytes, offset: int, table_id: int) -> tuple[int, int]:
+        """Start and end offsets of a PSI section, or (0, 0) if unreadable."""
+        byte3 = data[offset + 3]
+        if not byte3 & 0x10:
+            return 0, 0                       # no payload
+        start = offset + 4
+        if byte3 & 0x20:
+            start += 1 + data[offset + 4]     # skip the adaptation field
+        if start >= offset + TS_PACKET:
+            return 0, 0
+        start += 1 + data[start]              # skip the pointer field
+        if start + 3 > offset + TS_PACKET or data[start] != table_id:
+            return 0, 0
+        length = ((data[start + 1] & 0x0F) << 8) | data[start + 2]
+        end = min(start + 3 + length - 4, offset + TS_PACKET)  # less the CRC
+        return start, end
+
+    def _read_pat(self, data: bytes, offset: int) -> None:
+        start, end = self._section(data, offset, 0x00)
+        if not end:
+            return
+        i = start + 8
+        while i + 4 <= end:
+            program = (data[i] << 8) | data[i + 1]
+            if program:                        # 0 is the network PID, not a program
+                self._pmt_pid = ((data[i + 2] & 0x1F) << 8) | data[i + 3]
+                return
+            i += 4
+
+    def _read_pmt(self, data: bytes, offset: int) -> None:
+        start, end = self._section(data, offset, 0x02)
+        if not end or start + 12 > end:
+            return
+        i = start + 12 + (((data[start + 10] & 0x0F) << 8) | data[start + 11])
+        pids: set[int] = set()
+        while i + 5 <= end:
+            if data[i] in VIDEO_STREAM_TYPES:
+                pids.add(((data[i + 1] & 0x1F) << 8) | data[i + 2])
+            i += 5 + (((data[i + 3] & 0x0F) << 8) | data[i + 4])
+        if pids:
+            self._video_pids = frozenset(pids)
+
 
 
 class TSAligner:
@@ -212,13 +336,16 @@ class NetworkRegistry:
 class Subscriber:
     """One consumer of a broadcaster - an HTTP client or a transcoder's input."""
 
-    __slots__ = ("queue", "dropped", "closed", "label")
+    __slots__ = ("queue", "dropped", "closed", "label", "needs_keyframe")
 
     def __init__(self, maxsize: int, label: str = ""):
         self.queue: asyncio.Queue[Optional[bytes]] = asyncio.Queue(maxsize=maxsize)
         self.dropped = 0
         self.closed = False
         self.label = label
+        # Set while this consumer is waiting to be started on a keyframe rather
+        # than partway through a GOP.
+        self.needs_keyframe = False
 
     def put(self, chunk: Optional[bytes]) -> None:
         """Never blocks. A consumer that falls behind loses the oldest data."""
@@ -278,6 +405,11 @@ class Broadcaster:
         self.dropped_total = 0
         self._subscribers: set[Subscriber] = set()
         self._prebuffer = bytearray()
+        # Where in the prebuffer a consumer may be started, and where the
+        # program tables that precede those points are.
+        self._start_points = TSStartPoints()
+        self._prebuffer_raps: list[int] = []
+        self._prebuffer_pats: list[int] = []
         # True while the output is MPEG-TS, so replay can respect packet
         # boundaries. Cleared for profiles that mux to something else.
         self._ts_output = True
@@ -450,13 +582,18 @@ class Broadcaster:
 
     def subscribe(self, label: str = "") -> Subscriber:
         sub = Subscriber(self.settings.client_queue_chunks, label)
-        # Hand over recent data so playback (or an encoder) can start at once
-        # instead of waiting for the next keyframe.
+        # Hand over recent data so playback (or an encoder) can start at once,
+        # from the last keyframe in it rather than from wherever the backlog
+        # happens to begin.
         replay = self._replay_bytes()
         if replay:
             # One chunk: it is already a whole number of packets, and splitting
             # it would only risk the queue dropping half of it.
             sub.put(replay)
+        elif self._ts_output and self._start_points.marks_raps:
+            # Nothing to replay from. Rather than start it mid-GOP, hold it
+            # until the stream reaches its next keyframe.
+            sub.needs_keyframe = True
         self._subscribers.add(sub)
         self._cancel_idle_timer()
         self.start()
@@ -495,24 +632,70 @@ class Broadcaster:
         if self.ledger is not None:
             self.ledger.bytes_out += len(chunk)
         self._record_bitrate(len(chunk))
-        self._push_prebuffer(chunk)
-        await self._deliver(chunk)
+        # One pass over the packets locates both the points a consumer can be
+        # started from and the program tables in front of them.
+        pats: list[int] = []
+        raps: list[int] = []
+        if self._ts_output:
+            pats, raps = self._start_points.scan(chunk)
+        self._push_prebuffer(chunk, pats, raps)
+        await self._deliver(chunk, self._clean_start(pats, raps))
 
-    async def _deliver(self, chunk: bytes) -> None:
+    @staticmethod
+    def _clean_start(pats: list[int], raps: list[int]) -> Optional[int]:
+        """Offset in a chunk a consumer may be started at, if there is one.
+
+        The keyframe itself is the point that matters, but a demuxer starting
+        there has no program tables yet, so this rewinds to the last PAT in
+        front of it when the chunk carries one. That keeps the handover a
+        contiguous run of bytes, which the continuity counters depend on.
+        """
+        if not raps:
+            return None
+        rap = raps[0]
+        earlier = [offset for offset in pats if offset <= rap]
+        return earlier[-1] if earlier else rap
+
+    async def _deliver(self, chunk: bytes, start: Optional[int]) -> None:
         subscribers = list(self._subscribers)
         if not subscribers:
             return
         wait = self.settings.backpressure_seconds
         if wait <= 0:
             for sub in subscribers:
-                self._put_counting(sub, chunk)
+                portion = self._for_subscriber(sub, chunk, start)
+                if portion:
+                    self._put_counting(sub, portion)
             return
         deadline = asyncio.get_running_loop().time() + wait
         await asyncio.gather(
-            *(self._deliver_one(sub, chunk, deadline) for sub in subscribers)
+            *(self._deliver_one(sub, chunk, start, deadline) for sub in subscribers)
         )
 
-    async def _deliver_one(self, sub: Subscriber, chunk: bytes, deadline: float) -> None:
+    @staticmethod
+    def _for_subscriber(sub: Subscriber, chunk: bytes, start: Optional[int]) -> bytes:
+        """What of this chunk this consumer should get, which may be none of it.
+
+        A consumer waiting to be started on a keyframe gets nothing until one
+        arrives: handing it the bytes in between would put it back where it
+        began, with audio it can play and video it cannot.
+        """
+        if not sub.needs_keyframe:
+            return chunk
+        if start is None:
+            return b""
+        sub.needs_keyframe = False
+        return chunk[start:]
+
+    async def _deliver_one(
+        self, sub: Subscriber, chunk: bytes, start: Optional[int], deadline: float
+    ) -> None:
+        chunk = self._for_subscriber(sub, chunk, start)
+        if not chunk:
+            # Nothing to hand over, so nothing to wait for. Holding the source
+            # up for room in a queue we are not about to write to would stall
+            # every other viewer behind a consumer that is only marking time.
+            return
         loop = asyncio.get_running_loop()
         while sub.queue.full():
             # Give up waiting on a consumer that has gone away, otherwise a
@@ -532,6 +715,12 @@ class Broadcaster:
             sub.dropped = before
             if self.ledger is not None:
                 self.ledger.dropped_chunks += 1
+            # Restarting it on a keyframe was tried here and is not worth it:
+            # the hole is already inside the queue, in front of data the
+            # consumer is about to read, so the macroblocking happens either
+            # way and skipping to the next keyframe only throws more away. A
+            # consumer that reaches this point wants a transcode profile, not
+            # better handling of the bytes it cannot carry.
 
     async def attach(
         self, request_disconnected: Callable[[], Awaitable[bool]]
@@ -722,36 +911,89 @@ class Broadcaster:
             self.last_error = ""
             self._log("--- first bytes received ---")
 
-    def _push_prebuffer(self, chunk: bytes) -> None:
+    def _push_prebuffer(self, chunk: bytes, pats: list[int], raps: list[int]) -> None:
         limit = self.settings.prebuffer_bytes
         if limit <= 0:
             if self._prebuffer:
                 self._prebuffer.clear()
+                self._prebuffer_raps.clear()
+                self._prebuffer_pats.clear()
             return
+        base = len(self._prebuffer)
         self._prebuffer += chunk
-        excess = len(self._prebuffer) - limit
-        if excess > 0:
-            # Trim in whole packets, and in slabs, so this is not a memmove of
-            # the entire buffer on every 64 KB that arrives.
-            slab = max(excess, limit // 4)
-            slab = min(slab, len(self._prebuffer))
-            if self._ts_output:
-                slab -= slab % TS_PACKET
-            if slab > 0:
-                del self._prebuffer[:slab]
+        if self._ts_output:
+            self._prebuffer_raps += [base + offset for offset in raps]
+            self._prebuffer_pats += [base + offset for offset in pats]
+        self._trim_prebuffer(limit)
+
+    def _trim_prebuffer(self, limit: int) -> None:
+        """Discard the oldest backlog, in whole GOPs where the stream allows it.
+
+        Trimming to a byte count leaves the buffer starting partway through a
+        GOP, which is exactly the handover that puts a joining viewer's audio
+        ahead of its picture. Cutting at a keyframe instead means whatever is
+        left can always be replayed as-is.
+        """
+        if len(self._prebuffer) <= limit:
+            return
+
+        if self._ts_output and self._prebuffer_raps:
+            # The oldest start point that brings the buffer back under the
+            # limit; failing that, the newest one, even though keeping it
+            # overshoots - a backlog nobody can start from is worth less than
+            # a slightly large one.
+            keep = next(
+                (i for i, r in enumerate(self._prebuffer_raps)
+                 if len(self._prebuffer) - self._start_of(r) <= limit),
+                len(self._prebuffer_raps) - 1,
+            )
+            cut = self._start_of(self._prebuffer_raps[keep])
+            # A single GOP larger than several times the limit is not a GOP, it
+            # is a stream whose keyframes are too far apart to buffer. Fall
+            # through to the byte trim rather than hoarding it.
+            if cut or len(self._prebuffer) <= limit * PREBUFFER_GOP_SLACK:
+                if cut:
+                    self._discard_prebuffer(cut)
+                return
+
+        slab = max(len(self._prebuffer) - limit, limit // 4)
+        slab = min(slab, len(self._prebuffer))
+        if self._ts_output:
+            slab -= slab % TS_PACKET
+        if slab > 0:
+            self._discard_prebuffer(slab)
+
+    def _start_of(self, rap: int) -> int:
+        """Where a consumer starting at ``rap`` must actually begin reading."""
+        i = bisect_right(self._prebuffer_pats, rap)
+        return self._prebuffer_pats[i - 1] if i else rap
+
+    def _discard_prebuffer(self, cut: int) -> None:
+        del self._prebuffer[:cut]
+        raps = self._prebuffer_raps
+        pats = self._prebuffer_pats
+        self._prebuffer_raps = [r - cut for r in raps[bisect_left(raps, cut):]]
+        self._prebuffer_pats = [p - cut for p in pats[bisect_left(pats, cut):]]
 
     def _replay_bytes(self) -> bytes:
         """The backlog handed to a joining consumer.
 
-        For MPEG-TS this starts at a PAT, so the demuxer sees the program tables
-        immediately rather than resyncing from a random point mid-packet. That is
-        what a joining client gets from a real tuner backend, and some players
-        misbehave without it.
+        For MPEG-TS this starts at a video keyframe, with the program tables in
+        front of it, so the consumer has a picture from its first frame. Starting
+        it anywhere else hands it audio it can play and video it cannot, and the
+        gap between the two is where it stays for the rest of the session.
         """
         if not self._prebuffer:
             return b""
         if not self._ts_output:
             return bytes(self._prebuffer)
+        if self._prebuffer_raps:
+            return bytes(self._prebuffer[self._start_of(self._prebuffer_raps[0]):])
+        if self._start_points.marks_raps:
+            # This stream does flag its keyframes, there just is not one in the
+            # backlog. The caller waits for the next rather than replaying a
+            # partial GOP.
+            return b""
         start = self._first_pat_offset(self._prebuffer)
         return bytes(self._prebuffer[start:])
 

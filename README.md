@@ -39,9 +39,10 @@ concurrent streams and refuse the second one.
   and serves `/xmltv.xml` with ids rewritten to match the playlist.
 - **One upstream connection per channel** — however many viewers, whatever mix
   of profiles. Transcoders are consumers of the shared source, not extra tuners.
-- **Packet-aligned output** — clients always start on a 188-byte TS boundary, and
-  one joining a running channel starts at a PAT, so the demuxer gets program
-  tables immediately instead of resyncing from a random offset.
+- **Keyframe-aligned handover** — clients always start on a 188-byte TS boundary,
+  and one joining a running channel starts on a video keyframe with the program
+  tables in front of it. Starting mid-GOP is what leaves a player's audio running
+  a second or two ahead of its picture for the rest of the session.
 - **Nothing runs until someone watches** — sources start on the first request and
   stop after a configurable idle period.
 - **Self-healing** — dead sources restart with exponential backoff; stalled ones
@@ -293,6 +294,12 @@ still behind at that point is genuinely too slow rather than briefly outrun, and
 its oldest data is dropped so it cannot stall everyone else on the same source.
 Watch the session's **Dropped** column: it should be zero.
 
+A viewer that does lose data loses picture with it: the bytes after a hole
+decode against reference frames that never arrived, so it macroblocks until the
+next keyframe, and audio and video come out of the gap a different distance
+apart than they went in. Nothing downstream of the drop can undo that. Give a
+client that cannot carry the source a transcode profile instead.
+
 ### When the encoder can't keep up
 
 Transcoding is CPU-bound, and a source arrives in real time whether or not
@@ -401,7 +408,7 @@ lag badly.
 | Setting | What it does |
 |---|---|
 | **Linger after last client** | Keeps a source alive briefly after the last viewer leaves, so channel zapping doesn't restart it. Raise it if your sources are slow to start. |
-| **Prebuffer** | Recent stream data replayed to a joining client so playback starts immediately instead of waiting for the next keyframe. |
+| **Prebuffer** | Recent stream data replayed to a joining client so playback starts immediately. It is trimmed at keyframes rather than at a byte count, so the replay always begins somewhere a decoder can start; a stream whose keyframes are further apart than this may overshoot it. Set it to at least one keyframe interval — at 15 Mbit/s with a 2-second GOP that is about 4 MB. |
 | **Client queue** | 64 KB chunks buffered per viewer. A client that can't keep up drops data rather than stalling everyone else on the same source. |
 | **Startup timeout** | How long a newly started source may take to produce its first byte. Separate from the stall timeout, because connecting and authenticating is much slower than staying connected. Raise it for slow providers. |
 | **Stall timeout** | Restarts a source that stops producing data mid-stream. |
@@ -647,6 +654,7 @@ transcoder ended (exit code 8): Error opening output files: Encoder not found
 | `ignored SIGTERM, killing` | The command traps or ignores SIGTERM. Harmless, but raise **Terminate grace** to let it exit cleanly. |
 | `encoder behind: N dropped` | The transcode can't run in real time on this CPU. Faster preset, lower resolution, or hardware encoding. |
 | Glitching or macroblocking on a high-bitrate source | Check the session's **Dropped** count. Anything above zero means data is being discarded rather than held back — raise **Hold back a slow client for**, and see *Sources faster than real time*. |
+| Audio ahead of the picture | A viewer started partway through a GOP. This server starts one on a keyframe instead, but only when the source flags them: a muxer that never sets `random_access_indicator` leaves nothing to align on. Put a **Remux** profile in front of such a source — re-muxing through ffmpeg marks the keyframes. |
 | Rising continuity errors | Packet loss upstream. Check the network path to the provider; the worst-PID hint in the session row narrows it to video or audio. |
 | Rising transport errors | The source itself is marking packets corrupt — a bad tuner, aerial or upstream link, not something this server can fix. |
 | A source drops every few minutes and reconnects | Normal for live HLS behind a proxy or token: the window rotates and the source exits cleanly. See **Sources that rotate** below. |
