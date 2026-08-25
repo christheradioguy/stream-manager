@@ -70,6 +70,20 @@ class Source(BaseModel):
     # Higher is tried first, matching Tvheadend. Ties break on list order.
     priority: int = Field(default=0, ge=-1000, le=1000)
 
+    # Rebuild this source's audio timestamps from the stream's own clock.
+    #
+    # A few providers hand out streams whose audio timestamps are simply wrong -
+    # minutes away from the video's and advancing at the wrong rate - while the
+    # audio itself is complete and correctly interleaved with the picture it
+    # belongs to. Tolerant players ignore the timestamps and sound fine; players
+    # that pace themselves from the clock, which is most set-top and Android
+    # ones, stall or drift on them. No ffmpeg filter repairs it, because by the
+    # time a filter runs the demuxer has already paired the two streams using
+    # the very timestamps that are wrong.
+    #
+    # Leave it off unless a source needs it - tools/tsclock.py says which do.
+    fix_audio_timing: bool = False
+
     @field_validator("command")
     @classmethod
     def _parseable(cls, v: str) -> str:
@@ -276,6 +290,11 @@ class Profile(BaseModel):
             ffmpeg_bin,
             "-hide_banner",
             "-nostdin",
+            # Progress goes to stderr whatever the log level, because how far
+            # ahead of real time the encoder is running is a health signal worth
+            # having: sustained below 1.0 it cannot keep up and viewers starve.
+            # It is read for the metrics, not printed for a human.
+            "-stats",
             "-loglevel",
             loglevel,
             *shlex.split(self.input_args),
@@ -496,7 +515,17 @@ class SessionState(BaseModel):
     ts_continuity_errors: int = 0
     ts_scrambled: int = 0
     ts_discontinuities: int = 0
+    # Holes in the presentation timeline - content that never arrived. Unlike
+    # the two error counts, this survives a source that re-muxes.
+    ts_content_gaps: int = 0
+    ts_content_lost: float = 0.0
     ts_error_pids: list[dict[str, int]] = Field(default_factory=list)
+
+    # What the source tool itself reported this session, by kind, and how far
+    # ahead of real time it says it is running. Below 1.0 sustained means it
+    # cannot keep up. See tsstats.classify_log.
+    events: dict[str, int] = Field(default_factory=dict)
+    speed: float = 0.0
 
     # Which of the channel's sources is currently in use, and the pool it draws on.
     source_id: Optional[str] = None

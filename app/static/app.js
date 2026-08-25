@@ -400,7 +400,7 @@ function startPolling() {
 function blankSource(index) {
   return {
     id: "", name: index === 0 ? "Primary" : `Backup ${index}`,
-    command: "", use_shell: false, enabled: true,
+    command: "", use_shell: false, enabled: true, fix_audio_timing: false,
     network: null, priority: Math.max(0, 10 - index * 10),
   };
 }
@@ -445,6 +445,10 @@ function renderSources() {
           ${s.use_shell ? "checked" : ""}> <span>Shell</span></label>
         <label class="check" style="margin:0"><input type="checkbox" data-f="enabled"
           ${s.enabled ? "checked" : ""}> <span>Enabled</span></label>
+        <label class="check" style="margin:0"
+               title="For a provider whose audio timestamps are wrong: rebuilds them from the stream's own clock. Leave off unless tools/tsclock.py says this source needs it."><input
+          type="checkbox" data-f="fix_audio_timing"
+          ${s.fix_audio_timing ? "checked" : ""}> <span>Fix audio timing</span></label>
       </div>
       <div class="source-result"></div>
     </div>`;
@@ -555,6 +559,7 @@ function channelFromForm() {
       command: s.command.trim(),
       use_shell: !!s.use_shell,
       enabled: !!s.enabled,
+      fix_audio_timing: !!s.fix_audio_timing,
       network: s.network || null,
       priority: Number(s.priority) || 0,
     })),

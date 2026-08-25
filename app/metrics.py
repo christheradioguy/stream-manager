@@ -13,6 +13,7 @@ from typing import Iterable, Optional
 from .epg import EpgStore
 from .manager import SessionManager
 from .store import ConfigStore
+from .tsstats import LOG_EVENT_KINDS
 
 CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 
@@ -119,6 +120,12 @@ def render(
                  help_text="Measured output bitrate over the last five seconds.")
         w.metric("streams_manager_session_uptime_seconds", round(st.uptime_seconds, 3), labels,
                  help_text="Seconds since data started flowing on this session.")
+        # How far ahead of real time the source tool reports running. Sustained
+        # below 1.0 means it cannot keep up and viewers will starve; 0 means it
+        # has not said yet. Nothing else here reveals that.
+        w.metric("streams_manager_session_speed", round(st.speed, 3), labels,
+                 help_text="Source progress relative to real time, as the source "
+                           "tool reports it. Below 1.0 means it is falling behind.")
 
     # -- cumulative counters from the ledger --------------------------------
     for key, entry in manager.ledger.entries.items():
@@ -148,8 +155,43 @@ def render(
         w.metric(
             "streams_manager_ts_continuity_errors_total", entry.ts.continuity_errors, labels,
             kind="counter",
-            help_text="Continuity counter discontinuities, i.e. lost packets.",
+            help_text="Continuity counter discontinuities, i.e. lost packets. Note "
+                      "that a source ending in an ffmpeg re-mux rebuilds the transport "
+                      "layer, so this reads zero however damaged the content is - see "
+                      "streams_manager_source_events_total for those faults.",
         )
+        # Holes in the presentation timeline: content that never arrived. This
+        # is the one measure of lost content that survives a source which
+        # re-muxes, so it is what to watch on a passthrough channel.
+        w.metric(
+            "streams_manager_content_gaps_total", entry.ts.content_gaps, labels,
+            kind="counter",
+            help_text="Holes in the presentation timeline - frames that should have "
+                      "been there and were not. Unlike the continuity and transport "
+                      "counts, this survives a source that re-muxes.",
+        )
+        w.metric(
+            "streams_manager_content_lost_seconds_total", round(entry.ts.content_lost, 3),
+            labels, kind="counter",
+            help_text="Seconds of content missing from the presentation timeline.",
+        )
+        # What the source tool complained about, which is the only place most
+        # real faults show up: a re-muxing source drops what was damaged and
+        # emits a clean transport layer around the hole, so the counters above
+        # stay at zero while the picture breaks up.
+        # Every kind is published even at zero, so a dashboard can rate() them
+        # from the moment a channel first runs rather than only once something
+        # has already gone wrong.
+        for event in LOG_EVENT_KINDS:
+            count = entry.events.get(event, 0)
+            w.metric(
+                "streams_manager_source_events_total", count,
+                labels + [("event", event)], kind="counter",
+                help_text="Faults the source tool reported, by kind: decode (pictures "
+                          "or sound it could not reconstruct), timestamp (the stream's "
+                          "own timing is inconsistent), input (trouble reaching or "
+                          "holding the upstream), muxer (it had to intervene).",
+            )
 
     # -- per-session TS detail (resets with the session, hence gauges) -------
     for key, st in states.items():

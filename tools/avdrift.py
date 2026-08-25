@@ -196,11 +196,9 @@ def analyse(data: bytes, slices: int = 10) -> tuple[int, dict]:
     # A stream's own frame spacing sets what counts as a hole rather than a
     # normal gap, so this works whatever the rates are.
     steps: dict[str, list[float]] = {"video": [], "audio": []}
-    prev: dict[str, float] = {}
-    for _, kind, pts in marks:
-        if kind in prev:
-            steps[kind].append(pts - prev[kind])
-        prev[kind] = pts
+    for kind in ("video", "audio"):
+        times = sorted(p for _, k, p in marks if k == kind)
+        steps[kind] = [b - a for a, b in zip(times, times[1:])]
     limit = {}
     for kind in ("video", "audio"):
         good = sorted(d for d in steps[kind] if d > 0)
@@ -211,16 +209,18 @@ def analyse(data: bytes, slices: int = 10) -> tuple[int, dict]:
 
     edges = [len(data) * i // slices for i in range(slices + 1)]
     rows, total = [], {"video": 0.0, "audio": 0.0}
-    prev = {}
     for i in range(slices):
         lo, hi = edges[i], edges[i + 1]
         span = {"video": 0.0, "audio": 0.0}
-        for o, kind, pts in marks:
-            if not (lo <= o < hi):
-                continue
-            if kind in prev and 0 < pts - prev[kind] < limit[kind]:
-                span[kind] += pts - prev[kind]
-            prev[kind] = pts
+        for kind in ("video", "audio"):
+            # Sorted, because timestamps arrive in decode order: anything with
+            # B-frames reorders them, and summing differences as they come
+            # inflates the total by more than half on a typical broadcast
+            # stream. Sorting first makes this the span minus the holes, which
+            # is what it is supposed to be.
+            times = sorted(p for o, k, p in marks if k == kind and lo <= o < hi)
+            span[kind] = sum(b - a for a, b in zip(times, times[1:])
+                             if 0 < b - a < limit[kind])
         for k in span:
             total[k] += span[k]
         rows.append((lo, span, total["audio"] - total["video"]))

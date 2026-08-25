@@ -22,6 +22,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import shlex
 import signal
 import time
@@ -30,11 +31,12 @@ from collections import deque
 from typing import AsyncIterator, Awaitable, Callable, Optional
 
 from .models import Channel, Network, Profile, SessionState, Settings, Source
-from .tsstats import NULL_PID, LedgerEntry, TSAnalyser
+from .tsstats import NULL_PID, LedgerEntry, TSAnalyser, classify_log
 
 log = logging.getLogger(__name__)
 
 READ_CHUNK = 64 * 1024
+
 
 # A run that lasted this long counts as healthy: the next failure starts its
 # backoff from scratch instead of inheriting the previous ladder.
@@ -56,6 +58,9 @@ TS_SYNC_SEARCH_LIMIT = 1024 * 1024
 # it. Past this the stream's keyframes are simply too far apart to buffer,
 # and it is trimmed by bytes like any other.
 PREBUFFER_GOP_SLACK = 4
+
+# ffmpeg reports progress as "... bitrate=N speed=1.23x".
+_SPEED_RE = re.compile(r"speed=\s*([0-9]+\.?[0-9]*)x")
 
 # MPEG-TS timestamps are 33-bit values ticking at 90 kHz, and wrap.
 TS_CLOCK = 1 << 33
@@ -81,6 +86,280 @@ NO_PES_HEADER = frozenset({0xBC, 0xBE, 0xBF, 0xF0, 0xF1, 0xF2, 0xF8, 0xFF})
 
 def _carries_timestamps(stream_id: int) -> bool:
     return stream_id not in NO_PES_HEADER
+
+
+# Stream types the PMT uses for audio, alongside VIDEO_STREAM_TYPES above.
+AUDIO_STREAM_TYPES = frozenset({
+    0x03,  # MPEG-1 audio
+    0x04,  # MPEG-2 audio
+    0x0F,  # AAC (ADTS)
+    0x11,  # AAC (LATM)
+    0x1C,  # AAC (raw)
+    0x81,  # AC-3
+    0x87,  # E-AC-3
+})
+
+
+class TSAudioClock:
+    """Rebuilds audio timestamps from the stream's own clock.
+
+    A few providers hand out streams whose audio timestamps are simply wrong:
+    minutes away from the video's, advancing at the wrong rate, or both. The
+    audio itself is fine - every packet present, interleaved with the picture it
+    belongs to - and players that ignore timestamps sound perfect on it, which is
+    why such a stream can look healthy right up until something paces itself from
+    the clock and stalls.
+
+    No ffmpeg filter fixes this. By the time a filter runs the demuxer has
+    already decided which audio goes with which picture, using the timestamps
+    that are wrong, and no later correction recovers the pairing. This works a
+    step earlier, on the transport stream, where the information still exists.
+
+    Two things are needed and both are present in a stream like this:
+
+    * *Where* the audio belongs comes from its position. A muxer emits an audio
+      packet alongside the video it accompanies, so the clock reference at that
+      point in the stream says when it should play.
+    * *How long* each packet lasts comes from its size. Position alone is too
+      coarse - audio is emitted in bursts, and stamps derived from it jitter by
+      hundreds of milliseconds and run backwards. Constant-rate audio covers time
+      in proportion to its bytes, so the first packet is anchored from the clock
+      and the rest follow from the data. The result advances by exactly one frame
+      each time and cannot go backwards.
+    """
+
+    __slots__ = ("_pmt_pids", "_video_pids", "_audio_pids", "_pcr",
+                 "_lead", "_anchor", "_carried", "_per_byte", "_rate_from",
+                 "_last", "_marked")
+
+    # A decoder expects the picture a little ahead of the clock. Until the real
+    # figure is learned from the video, assume the usual.
+    DEFAULT_LEAD = (7 * TS_HZ) // 10
+
+    def __init__(self) -> None:
+        self._pmt_pids: set[int] = set()
+        self._video_pids: frozenset[int] = frozenset()
+        self._audio_pids: frozenset[int] = frozenset()
+        self._pcr: list[tuple[int, int]] = []      # (position, clock) pairs
+        self._lead: Optional[int] = None
+        self._anchor: Optional[int] = None
+        self._carried = 0                          # audio bytes since the anchor
+        self._per_byte: Optional[float] = None
+        self._rate_from: Optional[tuple[int, int]] = None   # (bytes, clock)
+        self._last: Optional[int] = None                   # last stamp emitted
+        self._marked = 0                                   # bytes at that stamp
+
+    def restart(self) -> None:
+        """The source reopened; anchor afresh rather than trusting the old one."""
+        self._anchor = None
+        self._carried = 0
+        self._marked = 0
+        self._last = None
+        self._pcr.clear()
+
+    def process(self, chunk: bytes, base: int) -> bytes:
+        """Rewrite the audio timestamps in a buffer of whole, aligned packets."""
+        data = bytearray(chunk)
+        for offset in range(0, len(data) - TS_PACKET + 1, TS_PACKET):
+            byte1 = data[offset + 1]
+            pid = ((byte1 & 0x1F) << 8) | data[offset + 2]
+            byte3 = data[offset + 3]
+            position = base + offset
+
+            if byte3 & 0x20 and data[offset + 4] >= 7 and data[offset + 5] & 0x10:
+                a = offset + 6
+                clock = (data[a] << 25 | data[a + 1] << 17 | data[a + 2] << 9
+                         | data[a + 3] << 1 | data[a + 4] >> 7)
+                self._pcr.append((position, clock))
+                if len(self._pcr) > 4:
+                    del self._pcr[0]
+
+            if pid == 0:
+                if byte1 & 0x40:
+                    self._read_pat(data, offset)
+                continue
+            if pid in self._pmt_pids:
+                if byte1 & 0x40:
+                    self._read_pmt(data, offset)
+                continue
+            if pid in self._video_pids:
+                self._learn_lead(data, offset, position)
+                continue
+            if pid in self._audio_pids:
+                self._stamp(data, offset, position)
+        return bytes(data)
+
+    # -- learning ----------------------------------------------------------
+
+    def _clock_at(self, position: int) -> Optional[int]:
+        """The clock at a byte position, interpolated between references."""
+        if len(self._pcr) < 2:
+            return None
+        (p1, t1), (p2, t2) = self._pcr[-2], self._pcr[-1]
+        if p2 == p1:
+            return t2
+        per_byte = ((t2 - t1) % TS_CLOCK) / (p2 - p1)
+        return int(t2 + (position - p2) * per_byte) % TS_CLOCK
+
+    def _learn_lead(self, data: bytearray, offset: int, position: int) -> None:
+        """How far ahead of the clock the video's stamps sit."""
+        header = self._pes_header(data, offset)
+        if header is None:
+            return
+        at, flags = header
+        if not flags & 0x80:
+            return
+        clock = self._clock_at(position)
+        if clock is None:
+            return
+        lead = (self._decode(data, at + 9) - clock) % TS_CLOCK
+        if lead > 5 * TS_HZ:            # not a sane buffering delay; ignore it
+            return
+        # Settle towards it rather than following every frame, so one odd
+        # stamp cannot drag the audio with it.
+        self._lead = lead if self._lead is None else (self._lead * 7 + lead) // 8
+
+    def _stamp(self, data: bytearray, offset: int, position: int) -> None:
+        byte3 = data[offset + 3]
+        if not byte3 & 0x10 or byte3 & 0xC0:
+            return
+        payload = offset + 4 + (1 + data[offset + 4] if byte3 & 0x20 else 0)
+        if payload >= offset + TS_PACKET:
+            return
+        header = self._pes_header(data, offset)
+        if header is None:
+            # A continuation packet: all of it is audio data.
+            self._carried += offset + TS_PACKET - payload
+            return
+        at, flags = header
+        body = at + 9 + data[at + 8]
+        if flags & 0x80:
+            clock = self._clock_at(position)
+            if self._anchor is None:
+                # Anchor the first packet on the clock where it sits, which is
+                # where the muxer put it alongside the picture it belongs with.
+                if clock is None:
+                    self._carried += max(0, offset + TS_PACKET - body)
+                    return
+                lead = self.DEFAULT_LEAD if self._lead is None else self._lead
+                self._anchor = (clock + lead) % TS_CLOCK
+                self._rate_from = (self._carried, clock)
+                self._marked = self._carried
+            self._learn_rate(clock)
+            if self._per_byte is None:
+                # The rate needs a second or so of audio to measure. Until then
+                # stamp from position: it jitters, but leaving the provider's own
+                # values in place would put minutes-wrong stamps in front of
+                # correct ones, which is far worse.
+                if clock is not None:
+                    lead = self.DEFAULT_LEAD if self._lead is None else self._lead
+                    self._emit(data, at, flags, offset, (clock + lead) % TS_CLOCK)
+                    # Keep the marker with it, or the first step once the rate
+                    # is known would span every byte since the anchor at once.
+                    self._marked = self._carried
+            elif self._last is None:
+                self._emit(data, at, flags, offset, self._anchor)
+                self._marked = self._carried
+            else:
+                # Step from the previous stamp by however much audio has gone by
+                # since it. Recomputing from the anchor instead would mean every
+                # refinement of the rate shifted the whole run at once, by more
+                # the longer it had been playing, and that shows up as jitter.
+                # Stepping keeps each interval exactly one packet of audio.
+                since = self._carried - self._marked
+                self._emit(data, at, flags, offset,
+                           (self._last + max(int(since * self._per_byte), 1)) % TS_CLOCK)
+                self._marked = self._carried
+        self._carried += max(0, offset + TS_PACKET - body)
+
+    def _emit(self, data: bytearray, at: int, flags: int, offset: int, value: int) -> None:
+        """Write a stamp, never letting it fall behind the one before it.
+
+        Both the correction above and the jittery opening second can produce a
+        value below its predecessor, and audio whose timestamps step backwards
+        is worse than audio that drifts - a decoder discards it. So the clock is
+        held forwards here, by a whole sample period at least, whatever the
+        arithmetic upstream produced.
+        """
+        if self._last is not None:
+            ahead = (value - self._last) % TS_CLOCK
+            if not 0 < ahead < TS_CLOCK // 2:
+                value = (self._last + 1) % TS_CLOCK
+        self._last = value
+        self._write(data, at + 9, value)
+        if flags & 0x40 and at + 19 <= offset + TS_PACKET:
+            self._write(data, at + 14, value)
+
+    def _learn_rate(self, clock: Optional[int]) -> None:
+        """Ticks per byte of audio, from how far the clock moved across it."""
+        if clock is None or self._rate_from is None:
+            return
+        bytes_since = self._carried - self._rate_from[0]
+        moved = (clock - self._rate_from[1]) % TS_CLOCK
+        # Wait for a decent span before trusting the figure, then keep refining
+        # it: too short a sample and the muxer's burstiness dominates.
+        if bytes_since > 16000 and moved and moved < 3600 * TS_HZ:
+            self._per_byte = moved / bytes_since
+
+    # -- packet plumbing ---------------------------------------------------
+
+    @staticmethod
+    def _pes_header(data: bytearray, offset: int) -> Optional[tuple[int, int]]:
+        """Where a PES header starts in this packet, and its second flag byte."""
+        byte3 = data[offset + 3]
+        if not byte3 & 0x10 or not data[offset + 1] & 0x40:
+            return None
+        at = offset + 4 + (1 + data[offset + 4] if byte3 & 0x20 else 0)
+        if at + 14 > offset + TS_PACKET or data[at:at + 3] != b"\x00\x00\x01":
+            return None
+        if data[at + 3] in NO_PES_HEADER:
+            return None
+        return at, data[at + 7]
+
+    @staticmethod
+    def _decode(data: bytearray, at: int) -> int:
+        return ((((data[at] >> 1) & 0x07) << 30) | (data[at + 1] << 22)
+                | (((data[at + 2] >> 1) & 0x7F) << 15) | (data[at + 3] << 7)
+                | (data[at + 4] >> 1))
+
+    @staticmethod
+    def _write(data: bytearray, at: int, value: int) -> None:
+        data[at] = (data[at] & 0xF0) | ((value >> 29) & 0x0E) | 0x01
+        data[at + 1] = (value >> 22) & 0xFF
+        data[at + 2] = ((value >> 14) & 0xFE) | 0x01
+        data[at + 3] = (value >> 7) & 0xFF
+        data[at + 4] = ((value << 1) & 0xFE) | 0x01
+
+    # -- tables ------------------------------------------------------------
+
+    def _read_pat(self, data: bytearray, offset: int) -> None:
+        start, end = TSStartPoints._section(data, offset, 0x00)
+        if not end:
+            return
+        i = start + 8
+        while i + 4 <= end:
+            if (data[i] << 8) | data[i + 1]:
+                self._pmt_pids.add(((data[i + 2] & 0x1F) << 8) | data[i + 3])
+            i += 4
+
+    def _read_pmt(self, data: bytearray, offset: int) -> None:
+        start, end = TSStartPoints._section(data, offset, 0x02)
+        if not end or start + 12 > end:
+            return
+        i = start + 12 + (((data[start + 10] & 0x0F) << 8) | data[start + 11])
+        video: set[int] = set()
+        audio: set[int] = set()
+        while i + 5 <= end:
+            pid = ((data[i + 1] & 0x1F) << 8) | data[i + 2]
+            if data[i] in VIDEO_STREAM_TYPES:
+                video.add(pid)
+            elif data[i] in AUDIO_STREAM_TYPES:
+                audio.add(pid)
+            i += 5 + (((data[i + 3] & 0x0F) << 8) | data[i + 4])
+        if video:
+            self._video_pids = frozenset(video)
+        if audio:
+            self._audio_pids = frozenset(audio)
 
 
 class TSRestamper:
@@ -276,6 +555,16 @@ class TSStartPoints:
     Streams whose muxer does not flag random access points leave ``marks_raps``
     false, and callers fall back to their previous behaviour rather than waiting
     for a keyframe that will never be announced.
+
+    A caveat worth knowing: random_access_indicator is the muxer's word for "a
+    decoder may begin here", and on an open-GOP H.264 stream that means a
+    recovery point rather than an IDR. The pictures immediately after it still
+    reference frames from before, so a decoder starting there has nothing to
+    reference until the recovery completes. Software decoders discard those and
+    carry on; some hardware decoders do not, and whether they survive depends on
+    exactly where the join landed - which is why such a stream can look fine on
+    a computer and fail unpredictably on a set-top box. Nothing here can mend
+    that; only re-encoding produces real IDRs.
     """
 
     __slots__ = ("_pmt_pid", "_video_pids", "marks_raps")
@@ -599,6 +888,10 @@ class Broadcaster:
         # Holds one timeline across restarts, so a reconnect does not rewind
         # every watching client's clock.
         self._restamper = TSRestamper()
+        # Rebuilds audio timestamps for sources whose provider gets them wrong.
+        # Off unless a source asks for it.
+        self._audio_clock: Optional[TSAudioClock] = None
+        self._published = 0
         # True while the output is MPEG-TS, so replay can respect packet
         # boundaries. Cleared for profiles that mux to something else.
         self._ts_output = True
@@ -609,6 +902,10 @@ class Broadcaster:
         # survives the session being torn down and recreated.
         self.analyser = TSAnalyser(enabled=settings.ts_analysis)
         self.ledger: Optional[LedgerEntry] = None
+        # What the source tool has complained about this session, and how fast
+        # it says it is running. The transport counters cannot see either.
+        self.events: dict[str, int] = {}
+        self.speed: float = 0.0
 
         self._procs: list[asyncio.subprocess.Process] = []
         self._runner: Optional[asyncio.Task] = None
@@ -647,6 +944,8 @@ class Broadcaster:
             # Whatever this attempt produces, its timestamps start over. Rebase
             # them onto the timeline clients are already watching.
             self._restamper.restart()
+            if self._audio_clock is not None:
+                self._audio_clock.restart()
             attempt_started = time.monotonic()
             fatal = False
             failure: Optional[StreamFailure] = None
@@ -811,6 +1110,11 @@ class Broadcaster:
         The wait is bounded: a consumer still full at the deadline is genuinely
         too slow, and its oldest data is dropped so it cannot stall everyone else.
         """
+        if self._ts_output and self._audio_clock is not None:
+            # Before the restamper, and before anything else: this repairs what
+            # the provider sent, the restamper then places it on our timeline.
+            chunk = self._audio_clock.process(chunk, self._published)
+        self._published += len(chunk)
         if self._ts_output:
             # Do this first: the prebuffer, the analyser and every consumer must
             # all see the same timeline the client is going to be given.
@@ -819,12 +1123,15 @@ class Broadcaster:
         if self._ts_output:
             before = self.analyser.counters
             packets, terr, cerr = before.packets, before.transport_errors, before.continuity_errors
+            gaps, lost = before.content_gaps, before.content_lost
             self.analyser.feed(chunk)
             after = self.analyser.counters
             if self.ledger is not None:
                 self.ledger.ts.packets += after.packets - packets
                 self.ledger.ts.transport_errors += after.transport_errors - terr
                 self.ledger.ts.continuity_errors += after.continuity_errors - cerr
+                self.ledger.ts.content_gaps += after.content_gaps - gaps
+                self.ledger.ts.content_lost += after.content_lost - lost
         if self.ledger is not None:
             self.ledger.bytes_out += len(chunk)
         self._record_bitrate(len(chunk))
@@ -1084,12 +1391,38 @@ class Broadcaster:
                     if text:
                         tail.append(text)
                         self._log(f"[{tag}] {text}")
+                        self._note(text)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
                 log.debug("stderr reader for %s ended", self.key, exc_info=True)
 
         self._helper_tasks.append(asyncio.create_task(drain()))
+
+    def _note(self, text: str) -> None:
+        """Count what the source tool reports, and note how fast it is running.
+
+        The transport-level counters are blind to most real faults, because a
+        source that re-muxes writes a clean transport layer around damaged
+        content. Its own log is where the evidence is, so it is tallied here and
+        published, which is what makes a bad source visible on a dashboard
+        rather than only in a log nobody is reading.
+        """
+        kind = classify_log(text)
+        if kind is not None:
+            self.events[kind] = self.events.get(kind, 0) + 1
+            if self.ledger is not None:
+                self.ledger.events[kind] = self.ledger.events.get(kind, 0) + 1
+            return
+        # ffmpeg's progress line carries how far ahead of real time it is.
+        # Below 1.0 sustained means the source cannot keep up and every viewer
+        # will eventually starve, which nothing else here would reveal.
+        found = _SPEED_RE.search(text)
+        if found:
+            try:
+                self.speed = float(found.group(1))
+            except ValueError:
+                pass
 
     # -- stats -------------------------------------------------------------
 
@@ -1241,7 +1574,11 @@ class Broadcaster:
             ts_continuity_errors=c.continuity_errors,
             ts_scrambled=c.scrambled,
             ts_discontinuities=c.discontinuities,
+            ts_content_gaps=c.content_gaps,
+            ts_content_lost=round(c.content_lost, 3),
             ts_error_pids=self.analyser.worst_pids(),
+            events=dict(self.events),
+            speed=self.speed,
             last_error=self.last_error,
             pids=[p.pid for p in self._procs if p.returncode is None],
         )
@@ -1385,6 +1722,16 @@ class SourceSession(Broadcaster):
 
         self._tried.add(source.id)
         self.active_source = source
+        # Sources differ in whether their provider's audio timestamps can be
+        # trusted, and failing over swaps one for another, so this is decided
+        # per attempt rather than once per session.
+        if source.fix_audio_timing and self._audio_clock is None:
+            self._audio_clock = TSAudioClock()
+            self._log("--- rebuilding audio timestamps from the stream clock ---")
+        elif not source.fix_audio_timing:
+            self._audio_clock = None
+        elif self._audio_clock is not None:
+            self._audio_clock.restart()
         if self.ledger is not None:
             self.ledger.connections += 1
         cmd = source.command

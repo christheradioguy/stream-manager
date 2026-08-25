@@ -447,6 +447,107 @@ lag badly.
 | **Terminate grace** | How long a process gets to exit on SIGTERM before it is killed. Raise it if you see `ignored SIGTERM, killing` in the log. |
 | **Default max clients** | Viewer cap per channel, counted across all profiles. 0 = unlimited. |
 
+## When a provider's timestamps are broken
+
+Some sources hand out streams whose audio and video timelines disagree — by
+seconds, sometimes by hours. ffmpeg spots the mismatch and corrects each stream
+separately, the two corrections drift apart, and lip sync gets worse the longer
+you watch. The source's log gives it away, thousands of lines of:
+
+```
+[vist#0:0/mpeg2video] timestamp discontinuity (stream id=0): 2404404545, new offset= 112612
+[aist#0:1/ac3]        timestamp discontinuity (stream id=0): -2404372545, new offset= 2404485157
+```
+
+Note the two offsets: one a second or so, the other seven hours. That is the
+desync being created, upstream of anything this server does.
+
+There is no known good fix here yet. Rebuilding the timestamps from frame and
+sample counts (`setpts=N/FRAME_RATE/TB`, `-af asetpts=N/SR/TB`) repairs a
+recorded file completely, and is worth trying on a channel that is already
+broken — but do not leave it on a channel that works. On a live source that is
+losing frames it converts each lost frame into lost *time*, so the output runs
+slower than real time and players fall behind until they stall. It was tried
+here and made a bad channel unplayable.
+
+If you hit this, the honest options are a different source URL for that channel,
+or living with it. `tools/avdrift.py` will tell you which of your channels are
+affected.
+
+## When a provider's audio timestamps are wrong
+
+A few sources hand out audio whose timestamps are minutes away from the video's
+and advance at the wrong rate, while the audio itself is complete and sitting
+exactly where it belongs between the pictures. ffplay and VLC ignore timestamps
+that look absurd and sound perfect on such a stream; anything that paces itself
+from the clock — most set-top boxes, and TiVimate and other ExoPlayer clients —
+stalls or drifts on it.
+
+`tools/tsclock.py` names it:
+
+```
+pid 256 video   vs clock: median    +0.767s   timeline spans 90.97s
+pid 257 audio   vs clock: median -4152.843s   timeline spans 75.65s
+audio timeline advances at 0.832x the video's - THEY DISAGREE
+```
+
+**No ffmpeg filter repairs this.** `asetpts`, `aresample`, `setpts`, wallclock
+timestamps — all of them run after the demuxer has already decided which audio
+goes with which picture, using the timestamps that are wrong. They can make the
+rate come out right while leaving the sound attached to the wrong moment, which
+measures beautifully and sounds worse than before.
+
+Tick **Fix audio timing** on the source instead. That works a step earlier, on
+the transport stream, where the information still exists: a packet's position
+says which picture it arrived beside, and its size says how long it lasts. On a
+real broken feed that turned 0.832x into 0.996x with no timestamp arriving late
+and every interval exactly one frame of audio.
+
+Leave it off unless a source needs it. It is safe on a healthy stream — the test
+suite checks that — but it is a repair, not an improvement.
+
+## Spotting a bad source from metrics
+
+The transport-level error counters — `ts_transport_errors_total` and
+`ts_continuity_errors_total` — only see damage done *after* the source command.
+A source ending in an ffmpeg re-mux (`ffmpeg -i … -c copy -f mpegts pipe:1`)
+rebuilds the transport layer from scratch: it drops whatever was damaged, writes
+a fresh continuity sequence and never sets the transport-error bit. A channel
+visibly breaking up therefore reports zero errors. Measured on a stream with 86
+packets dropped and 105 flagged corrupt: 191 continuity errors before the
+re-mux, **zero** after, with the decoder still reporting 147 problems.
+
+What it cannot do is invent the frames that went with the packets it dropped, so
+their timestamps are simply absent — and that hole is measurable whatever the
+source does. Three metrics see what the error counters cannot:
+
+| Metric | What it means |
+|---|---|
+| `streams_manager_content_gaps_total` | Holes in the presentation timeline: frames that should have been there and were not. **This is the one that works on a passthrough channel.** |
+| `streams_manager_content_lost_seconds_total` | How much content is missing, in seconds. Rate this for a "how bad is it" figure. |
+| `streams_manager_source_events_total{event=…}` | Faults the source tool itself reported. `decode` = pictures or sound it could not reconstruct. `timestamp` = the stream's own timing is inconsistent. `input` = trouble reaching or holding the upstream. `muxer` = it had to intervene. Note `decode` only appears where something decodes — a `-c copy` source does not, so use the gap counters for those. |
+| `streams_manager_session_speed` | How far ahead of real time the tool is running. Sustained below 1.0 means it cannot keep up and every viewer will eventually starve. |
+
+The gap counters read decode timestamps rather than presentation ones, because
+anything with B-frames presents out of order and the differences between
+presentation stamps would look like holes that are not there. A jump too large
+to be a lost frame is treated as a discontinuity and not counted, so a source
+reopening does not register as hours of missing content.
+
+Both are labelled by channel, kind, profile and source, so a query like
+
+```
+topk(5, rate(streams_manager_content_lost_seconds_total[15m]))
+```
+
+ranks your channels by how much content they are actually losing, passthrough
+and transcoded alike — which no other metric here can tell you. Every kind is published even at zero, so `rate()`
+works from the moment a channel first runs.
+
+**For `session_speed` on a source**, the command must emit ffmpeg's progress
+line. That is on by default; if you have set `-loglevel warning` or quieter, add
+`-stats` to get it back. Transcode profiles always emit it.
+
 ## Checking lip sync on a channel
 
 Audio and video are two streams of the same programme, so they should arrive in
@@ -720,11 +821,14 @@ transcoder ended (exit code 8): Error opening output files: Encoder not found
 | `encoder behind: N dropped` | The transcode can't run in real time on this CPU. Faster preset, lower resolution, or hardware encoding. |
 | Glitching or macroblocking on a high-bitrate source | Check the session's **Dropped** count. Anything above zero means data is being discarded rather than held back — raise **Hold back a slow client for**, and see *Sources faster than real time*. |
 | Audio ahead of the picture | A viewer started partway through a GOP. This server starts one on a keyframe instead, but only when the source flags them: a muxer that never sets `random_access_indicator` leaves nothing to align on. Put a **Remux** profile in front of such a source — re-muxing through ffmpeg marks the keyframes. |
+| Video macroblocking but the error counters read zero | Expected if the source re-muxes: ffmpeg rebuilds a clean transport layer around the damaged content. Watch `streams_manager_source_events_total{event="decode"}` instead — see *Spotting a bad source from metrics*. |
 | Rising continuity errors | Packet loss upstream. Check the network path to the provider; the worst-PID hint in the session row narrows it to video or audio. |
 | Rising transport errors | The source itself is marking packets corrupt — a bad tuner, aerial or upstream link, not something this server can fix. |
 | A source drops every few minutes and reconnects | Normal for live HLS behind a proxy or token: the window rotates and the source exits cleanly. See **Sources that rotate** below. |
 | Lip sync drifts further the longer a channel is left on | Was a source reopening: each new run restarted its timestamps and the viewer's clock was rewound with them, a little more out of sync every time. Fixed as of this version. Check the session's **Reopens** count — if it is climbing, that was it. |
 | Plays fine on a computer but slow and stuttering on a set-top or Android client | The two disagree about which clock to follow: desktop players decode by presentation stamp, set-top ones pace from the stream's clock references. A fault in the latter is invisible on one and crippling on the other. Fixed as of this version — a reopen used to leave a gap in the clock. |
+| Audio out of sync on a set-top box but fine in VLC or ffplay | The provider's audio timestamps. Run `tools/tsclock.py` on a capture; if it says the two timelines disagree while the audio's own frame count matches the video's span, tick **Fix audio timing** on that source. See *When a provider's audio timestamps are wrong*. |
+| Lip sync drifts on one channel while the others are fine | Most likely the provider's own timestamps, not this server. Check the session log for `timestamp discontinuity` lines with wildly different offsets for the video and audio streams. See *When a provider's timestamps are broken* — there is no reliable fix from this end. |
 | Audio steadily running ahead of the picture | Same cause, worst on AC-3 sources — most US broadcast channels. AC-3 travels as `private_stream_1`, below where audio stream ids are usually assumed to start, so it was being left behind when the video was put back on the timeline: one run's length further ahead every reopen. Fixed as of this version. `tools/avdrift.py` measures it if you want to confirm. |
 | `Connection reset by peer` right after a reopen | Usually a leftover helper still holding the old connection, so the new one looks like a second client. Fixed as of this version; if it persists, raise **Reopen delay** and prefer letting the source tool retry internally. |
 | Stream plays then dies after ~30s | Source stopped producing. Check the log; if the source is just slow, raise **Stall timeout**. |

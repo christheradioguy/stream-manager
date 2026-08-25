@@ -28,6 +28,7 @@ HZ = 90000.0
 def walk(path):
     data = open(path, "rb").read()
     pcrs, ptss, counts = [], [], {}
+    by_pid = {}
     for o in range(0, len(data) - P + 1, P):
         if data[o] != 0x47:
             continue
@@ -49,10 +50,11 @@ def walk(path):
                 pts = ((((b[0] >> 1) & 7) << 30) | (b[1] << 22)
                        | (((b[2] >> 1) & 0x7F) << 15) | (b[3] << 7) | (b[4] >> 1)) / HZ
                 ptss.append((o, pid, pts))
-    return data, pcrs, ptss, counts
+                by_pid.setdefault(pid, []).append((o, pts, data[s+3]))
+    return data, pcrs, ptss, counts, by_pid
 
 for path in sys.argv[1:]:
-    data, pcrs, ptss, counts = walk(path)
+    data, pcrs, ptss, counts, by_pid = walk(path)
     print(f"\n== {path.split('/')[-1]}  {len(data)/1e6:.1f} MB")
     if not pcrs:
         print("   NO PCR AT ALL - a player with no clock to follow")
@@ -73,6 +75,43 @@ for path in sys.argv[1:]:
 
     span = series[-1][1] - series[0][1]
     print(f"   PCR spans {span:.1f}s across the capture")
+
+    # Per stream, because the two halves of a programme break independently and
+    # the remedy differs. Audio whose stamps are wrong but whose content is
+    # intact can be rebuilt from the sample count; audio that is genuinely
+    # losing packets must not be, because closing the gaps drags everything
+    # after them earlier and makes the drift worse.
+    print("   per stream:")
+    spans = {}
+    for pid, lst in sorted(by_pid.items()):
+        sid = lst[0][2]
+        kind = ("video" if 0xE0 <= sid <= 0xEF
+                else "audio" if sid == 0xBD or 0xC0 <= sid <= 0xDF
+                else f"0x{sid:02X}")
+        k = 0
+        rel = []
+        for off, value, _ in lst:
+            while k + 1 < len(series) and series[k + 1][0] <= off:
+                k += 1
+            rel.append(value - series[k][1])
+        rel.sort()
+        span = max(v for _, v, _ in lst) - min(v for _, v, _ in lst)
+        spans.setdefault(kind, span)
+        print(f"     pid {pid:5d} {kind:6} {len(lst):5d} PES   vs clock: median "
+              f"{rel[len(rel)//2]:+9.3f}s  spread {rel[-1]-rel[0]:6.3f}s   "
+              f"timeline spans {span:7.2f}s")
+    if spans.get("video") and "audio" in spans:
+        ratio = spans["audio"] / spans["video"]
+        if 0.98 < ratio < 1.02:
+            print(f"   audio timeline advances at {ratio:.3f}x the video's - they agree")
+        else:
+            print(f"   audio timeline advances at {ratio:.3f}x the video's - THEY DISAGREE")
+            print("     Check whether the audio content is all there: frame count times")
+            print("     frame duration should match the video's span. If it is, a")
+            print("     transcode profile with '-af asetpts=N/SR/TB' rebuilds the")
+            print("     timestamps from the samples and fixes it. If audio packets are")
+            print("     genuinely missing, do NOT use that - it closes the gaps and")
+            print("     makes the drift worse.")
 
     # Where the timestamps sit relative to the clock. A frame whose PTS is
     # behind the clock is already late; one absurdly ahead makes a player that

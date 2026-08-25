@@ -499,11 +499,245 @@ def starts_on_keyframe(data: bytes) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Rebuilding audio timestamps from the stream clock
+# ---------------------------------------------------------------------------
+
+_AC_CC: dict[int, int] = {}
+AC_VPID, AC_APID, AC_PMT = 0x100, 0x101, 0x1000
+
+
+def _ac_packet(pid: int, payload: bytes = b"", pusi: bool = False,
+               pcr: int | None = None) -> bytes:
+    cc = _AC_CC.get(pid, 0)
+    _AC_CC[pid] = (cc + 1) & 0x0F
+    field = b""
+    if pcr is not None:
+        field = bytes([7, 0x10, (pcr >> 25) & 0xFF, (pcr >> 17) & 0xFF,
+                       (pcr >> 9) & 0xFF, (pcr >> 1) & 0xFF,
+                       ((pcr << 7) & 0x80) | 0x7E, 0x00])
+    head = bytes([0x47, (0x40 if pusi else 0) | (pid >> 8), pid & 0xFF,
+                  (0x30 if field else 0x10) | cc])
+    body = head + field + payload
+    return body + b"\xff" * (TS_PACKET - len(body))
+
+
+def _ac_stamp(value: int) -> bytes:
+    return bytes([0x20 | ((value >> 29) & 0x0E) | 1, (value >> 22) & 0xFF,
+                  ((value >> 14) & 0xFE) | 1, (value >> 7) & 0xFF,
+                  ((value << 1) & 0xFE) | 1])
+
+
+def _ac_section(table_id: int, body: bytes) -> bytes:
+    length = len(body) + 4
+    return (b"\x00" + bytes([table_id, 0xB0 | (length >> 8), length & 0xFF])
+            + body + b"\x00" * 4)
+
+
+def _ac_stream(seconds: float, audio_pts) -> bytes:
+    """A stream with sound video and whatever audio timestamps are asked for."""
+    pat = _ac_packet(0, _ac_section(0x00, bytes([0, 1, 0xC1, 0, 0])
+                                    + bytes([0, 1, 0xE0 | (AC_PMT >> 8), AC_PMT & 0xFF])),
+                     pusi=True)
+    pmt_body = (bytes([0, 1, 0xC1, 0, 0, 0xE0 | (AC_VPID >> 8), AC_VPID & 0xFF, 0xF0, 0])
+                + bytes([0x1B, 0xE0 | (AC_VPID >> 8), AC_VPID & 0xFF, 0xF0, 0])
+                + bytes([0x81, 0xE0 | (AC_APID >> 8), AC_APID & 0xFF, 0xF0, 0]))
+    out = bytearray()
+    per_frame = 90000 // 30
+    for i in range(int(seconds * 30)):
+        clock = i * per_frame
+        out += pat
+        out += _ac_packet(AC_PMT, _ac_section(0x02, pmt_body), pusi=True)
+        out += _ac_packet(AC_VPID, bytes([0, 0, 1, 0xE0, 0, 0, 0x80, 0x80, 5])
+                          + _ac_stamp(clock + 63000) + b"v" * 120, pusi=True, pcr=clock)
+        out += _ac_packet(AC_VPID, b"v" * 176, pcr=clock + per_frame // 2)
+        for _ in range(5):
+            out += _ac_packet(AC_VPID, b"v" * 184)
+        out += _ac_packet(AC_APID, bytes([0, 0, 1, 0xBD, 0, 0, 0x80, 0x80, 5])
+                          + _ac_stamp(audio_pts(i)) + b"a" * 120, pusi=True)
+    return bytes(out)
+
+
+def _ac_stamps(data: bytes, pid: int) -> list[int]:
+    found = []
+    for offset in range(0, len(data) - TS_PACKET + 1, TS_PACKET):
+        if data[offset] != 0x47:
+            continue
+        if (((data[offset + 1] & 0x1F) << 8) | data[offset + 2]) != pid:
+            continue
+        byte3 = data[offset + 3]
+        if not byte3 & 0x10 or not data[offset + 1] & 0x40:
+            continue
+        at = offset + 4 + (1 + data[offset + 4] if byte3 & 0x20 else 0)
+        if data[at:at + 3] != b"\x00\x00\x01" or not data[at + 7] & 0x80:
+            continue
+        b = data[at + 9:at + 14]
+        found.append(((((b[0] >> 1) & 7) << 30) | (b[1] << 22)
+                      | (((b[2] >> 1) & 0x7F) << 15) | (b[3] << 7) | (b[4] >> 1)))
+    return found
+
+
+def _ac_run(data: bytes) -> bytes:
+    sys.path.insert(0, str(ROOT))
+    from app.session import TSAudioClock
+
+    clock = TSAudioClock()
+    out = bytearray()
+    position = 0
+    step = 65536 // TS_PACKET * TS_PACKET
+    for i in range(0, len(data), step):
+        part = data[i:i + step]
+        out += clock.process(part, position)
+        position += len(part)
+    return bytes(out)
+
+
+def check_content_gaps() -> None:
+    """Lost content on a stream that has been re-muxed.
+
+    The transport-level counters cannot see this. A source ending in an ffmpeg
+    re-mux drops whatever was damaged and writes a clean transport layer around
+    the hole, so continuity and transport errors both read zero however much is
+    missing. What it cannot do is invent the frames that went with the dropped
+    packets, so their timestamps are absent - and that hole is measurable.
+
+    Decode timestamps are used rather than presentation ones, because anything
+    with B-frames presents out of order and the differences between presentation
+    stamps would read as holes that are not there.
+    """
+    print("\nContent gap detection")
+    sys.path.insert(0, str(ROOT))
+    from app.tsstats import TSAnalyser
+
+    work = Path(tempfile.mkdtemp(prefix="sm-gaps-"))
+    try:
+        source = work / "src.ts"
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25",
+             "-f", "lavfi", "-i", "sine=frequency=440", "-t", "30",
+             "-c:v", "mpeg2video", "-b:v", "1500k", "-g", "15", "-bf", "2",
+             "-c:a", "ac3", "-f", "mpegts", str(source)], check=True)
+
+        original = source.read_bytes()
+        thinned = bytearray()
+        for i, offset in enumerate(range(0, len(original) - TS_PACKET + 1, TS_PACKET)):
+            if i % 250 == 249:                       # lose one packet in 250
+                continue
+            thinned += original[offset:offset + TS_PACKET]
+        damaged = work / "damaged.ts"
+        damaged.write_bytes(bytes(thinned))
+
+        # Re-mux both, which is what a source command does to them.
+        for name in ("src", "damaged"):
+            subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i",
+                 str(work / f"{name}.ts"), "-c", "copy", "-f", "mpegts",
+                 "-y", str(work / f"{name}_out.ts")], check=True)
+
+        def measure(path: Path):
+            analyser = TSAnalyser()
+            analyser.feed(path.read_bytes())
+            return analyser.counters
+
+        clean = measure(work / "src_out.ts")
+        broken = measure(work / "damaged_out.ts")
+
+        check("a re-mux hides lost content from the error counters",
+              broken.continuity_errors == 0 and broken.transport_errors == 0,
+              f"continuity={broken.continuity_errors} transport={broken.transport_errors}")
+        check("lost content is still counted as gaps in the timeline",
+              broken.content_gaps > 0,
+              f"{broken.content_gaps} gaps, {broken.content_lost:.2f}s missing")
+        check("an undamaged stream reports no gaps",
+              clean.content_gaps == 0,
+              f"{clean.content_gaps} gaps, {clean.content_lost:.2f}s")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def check_log_classifier() -> None:
+    """What a source tool says about the stream, sorted into countable kinds.
+
+    The transport-level counters cannot see most real faults: a source ending in
+    an ffmpeg re-mux drops whatever was damaged and writes a clean transport
+    layer around the hole, so a channel that is visibly breaking up reports zero
+    errors. Its log is the only place the evidence survives, so it is classified
+    and counted - and ordinary chatter must not be counted, or the number means
+    nothing.
+    """
+    print("\nSource log classifier")
+    sys.path.insert(0, str(ROOT))
+    from app.tsstats import classify_log
+
+    faults = {
+        "decode": "[h264 @ 0x1] error while decoding MB 54 33",
+        "timestamp": "[mpegts @ 0x1] Non-monotonic DTS in output stream 0:0",
+        "input": "[http @ 0x1] Will reconnect at 0, error=Connection timed out.",
+        "muxer": "[mpegts @ 0x1] Timestamps are unset in a packet for stream 0.",
+    }
+    for kind, line in faults.items():
+        check(f"a {kind} fault is recognised", classify_log(line) == kind,
+              f"got {classify_log(line)!r}")
+
+    chatter = [
+        "size=  151742kB time=00:01:29.12 bitrate=13946.9kbits/s speed=1.23x",
+        "  Stream #0:1(eng): Audio: ac3 (AC-3 / 0x332D4341), 48000 Hz, 5.1(side)",
+        "Output #0, mpegts, to 'pipe:1':",
+        "  built with gcc 13 (Ubuntu 13.2.0-23ubuntu3)",
+    ]
+    check("ordinary output is not counted as a fault",
+          all(classify_log(line) is None for line in chatter),
+          next((l for l in chatter if classify_log(l)), ""))
+
+
+def check_audio_clock() -> None:
+    """A provider that stamps its audio wrongly, and one that does not.
+
+    Some sources hand out audio whose timestamps are minutes from the video's
+    and advance at the wrong rate, while the audio itself is complete and sitting
+    exactly where it belongs between the pictures. Tolerant players ignore the
+    timestamps; anything pacing itself from the clock stalls. The repair takes
+    the clock at each packet's own position and the audio's own byte rate, and
+    must leave a stream that was already correct alone.
+    """
+    print("\nAudio clock rebuild")
+    _AC_CC.clear()
+    broken = _ac_stream(40, lambda i: (i * 2000 + 12_000_000) % (1 << 33))
+    video = _ac_stamps(broken, AC_VPID)
+    before = _ac_stamps(broken, AC_APID)
+    after = _ac_stamps(_ac_run(broken), AC_APID)
+
+    span = (video[-1] - video[0])
+    was = (before[-1] - before[0]) / span
+    now = (after[-1] - after[0]) / span
+    check("a source whose audio runs at the wrong rate is corrected",
+          0.97 < now < 1.03, f"{was:.3f}x before, {now:.3f}x after")
+    check("the repaired audio starts alongside the video",
+          abs(after[0] - video[0]) < 90000,
+          f"{(after[0]-video[0])/90000:+.2f}s (was {(before[0]-video[0])/90000:+.1f}s)")
+    gaps = [b - a for a, b in zip(after, after[1:])]
+    check("repaired timestamps never step backwards",
+          all(g > 0 for g in gaps), f"{sum(1 for g in gaps if g <= 0)} do not advance")
+
+    _AC_CC.clear()
+    healthy = _ac_stream(40, lambda i: (i * (90000 // 30) + 63000) % (1 << 33))
+    good = _ac_stamps(healthy, AC_APID)
+    left = _ac_stamps(_ac_run(healthy), AC_APID)
+    moved = max(abs(a - b) for a, b in zip(good, left)) / 90000
+    check("a source that was already correct is barely touched",
+          moved < 1.0, f"largest stamp moved {moved*1000:.0f} ms")
+
+
 def main() -> int:
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
             print(f"{tool} is required for this test")
             return 2
+
+    check_content_gaps()
+    check_log_classifier()
+    check_audio_clock()
 
     port = free_port()
     base = f"http://127.0.0.1:{port}"
@@ -1152,8 +1386,22 @@ def main() -> int:
                      "streams_manager_ts_continuity_errors_total",
                      "streams_manager_ts_transport_errors_total",
                      "streams_manager_network_max_streams",
+                     "streams_manager_source_events_total",
+                     "streams_manager_content_gaps_total",
+                     "streams_manager_content_lost_seconds_total",
+                     "streams_manager_session_speed",
                      "streams_manager_epg_mapped_channels"):
             check(f"exposes {name}", name in names)
+        # Every kind must be published even at zero, or a dashboard cannot
+        # rate() them until after something has already gone wrong.
+        from app.tsstats import LOG_EVENT_KINDS
+        published = {line.split('event="')[1].split('"')[0]
+                     for line in body.splitlines()
+                     if line.startswith("streams_manager_source_events_total")
+                     and 'event="' in line}
+        check("source events are published for every kind, including zeroes",
+              set(LOG_EVENT_KINDS) <= published,
+              f"missing {sorted(set(LOG_EVENT_KINDS) - published)}" if published else "none published")
         check("every metric declares a TYPE",
               all(f"# TYPE {n} " in body for n in names), "")
         check("counters carry TS errors from the ledger",
