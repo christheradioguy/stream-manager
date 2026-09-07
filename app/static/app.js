@@ -71,6 +71,17 @@ function slugify(s) {
     .slice(0, 64);
 }
 
+function setBusy(button, label) {
+  const idle = button.dataset.idleText || button.textContent;
+  button.dataset.idleText = idle;
+  button.disabled = true;
+  button.textContent = label;
+  return () => {
+    button.disabled = false;
+    button.textContent = idle;
+  };
+}
+
 /* -------------------------------------------------------------------- api */
 
 async function api(path, options = {}) {
@@ -584,7 +595,7 @@ $("#c-name").addEventListener("input", () => {
 });
 $("#c-id").addEventListener("input", () => { $("#c-id").dataset.touched = "1"; });
 
-$("#channel-save").addEventListener("click", async () => {
+async function submitChannelForm() {
   const form = $("#channel-form");
   if (!form.reportValidity()) return;
   if (!state.draftSources.some((s) => s.command.trim())) {
@@ -601,6 +612,7 @@ $("#channel-save").addEventListener("click", async () => {
     return;
   }
   const channel = channelFromForm();
+  const done = setBusy($("#channel-save"), state.editingChannel !== null ? "Saving…" : "Adding…");
   try {
     if (state.editingChannel !== null) {
       await api(`/api/channels/${encodeURIComponent(state.editingChannel)}`,
@@ -612,10 +624,18 @@ $("#channel-save").addEventListener("click", async () => {
     }
     $("#channel-modal").hidden = true;
     $("#c-id").dataset.touched = "";
-    refresh();
+    await refresh();
   } catch (err) {
     toast(err.message, "err");
+  } finally {
+    done();
   }
+}
+
+$("#channel-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  if ($("#channel-save").disabled) return;
+  await submitChannelForm();
 });
 
 function renderTestResult(r) {
@@ -695,7 +715,7 @@ $("#p-name").addEventListener("input", () => {
 });
 $("#p-id").addEventListener("input", () => { $("#p-id").dataset.touched = "1"; });
 
-$("#profile-save").addEventListener("click", async () => {
+async function submitProfileForm() {
   if (!$("#profile-form").reportValidity()) return;
   const profile = {
     id: $("#p-id").value.trim(),
@@ -705,6 +725,7 @@ $("#profile-save").addEventListener("click", async () => {
     output_args: $("#p-output").value.trim(),
     container: $("#p-container").value.trim() || "mpegts",
   };
+  const done = setBusy($("#profile-save"), state.editingProfile !== null ? "Saving…" : "Adding…");
   try {
     if (state.editingProfile !== null) {
       await api(`/api/profiles/${encodeURIComponent(state.editingProfile)}`,
@@ -715,8 +736,18 @@ $("#profile-save").addEventListener("click", async () => {
     toast(`Saved ${profile.name}`);
     $("#profile-modal").hidden = true;
     $("#p-id").dataset.touched = "";
-    refresh();
-  } catch (err) { toast(err.message, "err"); }
+    await refresh();
+  } catch (err) {
+    toast(err.message, "err");
+  } finally {
+    done();
+  }
+}
+
+$("#profile-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  if ($("#profile-save").disabled) return;
+  await submitProfileForm();
 });
 
 $("#profile-rows").addEventListener("click", async (ev) => {
@@ -762,7 +793,7 @@ $("#n-name").addEventListener("input", () => {
 });
 $("#n-id").addEventListener("input", () => { $("#n-id").dataset.touched = "1"; });
 
-$("#network-save").addEventListener("click", async () => {
+async function submitNetworkForm() {
   if (!$("#network-form").reportValidity()) return;
   const network = {
     id: $("#n-id").value.trim(),
@@ -771,6 +802,7 @@ $("#network-save").addEventListener("click", async () => {
     max_streams: Number($("#n-max").value) || 0,
     enabled: $("#n-enabled").checked,
   };
+  const done = setBusy($("#network-save"), state.editingNetwork !== null ? "Saving…" : "Adding…");
   try {
     if (state.editingNetwork !== null) {
       await api(`/api/networks/${encodeURIComponent(state.editingNetwork)}`,
@@ -781,8 +813,18 @@ $("#network-save").addEventListener("click", async () => {
     toast(`Saved ${network.name}`);
     $("#network-modal").hidden = true;
     $("#n-id").dataset.touched = "";
-    refresh();
-  } catch (err) { toast(err.message, "err"); }
+    await refresh();
+  } catch (err) {
+    toast(err.message, "err");
+  } finally {
+    done();
+  }
+}
+
+$("#network-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  if ($("#network-save").disabled) return;
+  await submitNetworkForm();
 });
 
 $("#network-rows").addEventListener("click", async (ev) => {
