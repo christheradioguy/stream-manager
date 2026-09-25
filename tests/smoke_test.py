@@ -12,6 +12,7 @@ Requires ffmpeg/ffprobe on PATH.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
@@ -181,6 +182,92 @@ def run_analyser_checks() -> None:
     check("analyser: can be disabled", off.counters.packets == 0)
 
 
+def run_background_restart_checks() -> None:
+    """Saving edits should not wait for live-session teardown to finish."""
+    sys.path.insert(0, str(ROOT))
+    from fastapi import BackgroundTasks
+
+    from app.models import Channel, Profile
+    import app.main as sm
+
+    async def check_channel_update() -> None:
+        calls: list[tuple[str, str]] = []
+        original_update = sm.store.update_channel
+        original_stop = sm.manager.stop_channel
+
+        async def fake_update(channel_id: str, channel: Channel) -> Channel:
+            calls.append(("update", channel_id))
+            return channel
+
+        async def fake_stop(channel_id: str, reason: str = "channel changed") -> None:
+            await asyncio.sleep(0.2)
+            calls.append(("stop", f"{channel_id}:{reason}"))
+
+        sm.store.update_channel = fake_update
+        sm.manager.stop_channel = fake_stop
+        try:
+            bg = BackgroundTasks()
+            channel = Channel(
+                id="demo",
+                name="Demo",
+                sources=[{"id": "src1", "command": "printf x"}],
+            )
+            started = time.monotonic()
+            body = await sm.update_channel("demo", channel, bg)
+            elapsed = time.monotonic() - started
+            check("channel edit returns without waiting for teardown",
+                  elapsed < 0.1, f"{elapsed:.3f}s")
+            check("channel edit queues a background restart",
+                  len(bg.tasks) == 1, f"{len(bg.tasks)} task(s)")
+            check("channel edit persists before restarting",
+                  calls == [("update", "demo")], str(calls))
+            check("channel edit returns the updated record", body["id"] == "demo")
+            await bg()
+            check("queued channel restart runs after the response",
+                  calls == [("update", "demo"), ("stop", "demo:channel edited")], str(calls))
+        finally:
+            sm.store.update_channel = original_update
+            sm.manager.stop_channel = original_stop
+
+    async def check_profile_update() -> None:
+        calls: list[tuple[str, str]] = []
+        original_update = sm.store.update_profile
+        original_stop = sm.manager.stop_profile
+
+        async def fake_update(profile_id: str, profile: Profile) -> Profile:
+            calls.append(("update", profile_id))
+            return profile
+
+        async def fake_stop(profile_id: str, reason: str = "profile changed") -> None:
+            await asyncio.sleep(0.2)
+            calls.append(("stop", f"{profile_id}:{reason}"))
+
+        sm.store.update_profile = fake_update
+        sm.manager.stop_profile = fake_stop
+        try:
+            bg = BackgroundTasks()
+            profile = Profile(id="copy", name="Copy", output_args="-c copy")
+            started = time.monotonic()
+            body = await sm.update_profile("copy", profile, bg)
+            elapsed = time.monotonic() - started
+            check("profile edit returns without waiting for teardown",
+                  elapsed < 0.1, f"{elapsed:.3f}s")
+            check("profile edit queues a background restart",
+                  len(bg.tasks) == 1, f"{len(bg.tasks)} task(s)")
+            check("profile edit persists before restarting",
+                  calls == [("update", "copy")], str(calls))
+            check("profile edit returns the updated record", body["id"] == "copy")
+            await bg()
+            check("queued profile restart runs after the response",
+                  calls == [("update", "copy"), ("stop", "copy:profile edited")], str(calls))
+        finally:
+            sm.store.update_profile = original_update
+            sm.manager.stop_profile = original_stop
+
+    asyncio.run(check_channel_update())
+    asyncio.run(check_profile_update())
+
+
 def ts_continuity_errors(data: bytes) -> int:
     """Continuity errors in a captured stream, via the server's own analyser."""
     sys.path.insert(0, str(ROOT))
@@ -331,6 +418,13 @@ def hold_capture(url: str, seconds: float) -> bytes:
     except Exception as exc:  # noqa: BLE001 - reported by the caller
         print(f"    (hold ended: {exc})")
     return b"".join(out)
+
+
+def stream_headers(url: str, timeout: float = 15.0) -> dict[str, str]:
+    """Open a stream briefly and return its response headers."""
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        resp.read(4096)  # prove the body is actually flowing
+        return dict(resp.headers.items())
 
 
 TS_PACKET = 188
@@ -738,6 +832,7 @@ def main() -> int:
     check_content_gaps()
     check_log_classifier()
     check_audio_clock()
+    run_background_restart_checks()
 
     port = free_port()
     base = f"http://127.0.0.1:{port}"
@@ -940,6 +1035,10 @@ def main() -> int:
         check("output is valid MPEG-TS", is_mpegts(data))
         check("first client starts on a packet boundary", is_aligned(data),
               f"sync offset={sync_offset(data)}")
+        headers = stream_headers(f"{base}/stream/testcard")
+        check("stream does not force Connection: close",
+              headers.get("Connection", "").lower() != "close",
+              headers.get("Connection", "(absent)"))
 
         # A client joining an already-running session gets the prebuffer replayed.
         # That replay must be packet-aligned, lead with a PAT, and open on a
