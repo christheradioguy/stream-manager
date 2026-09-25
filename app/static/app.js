@@ -507,7 +507,7 @@ $("#c-sources").addEventListener("click", async (ev) => {
     const r = await api("/api/test", {
       method: "POST",
       body: { command: src.command, use_shell: src.use_shell,
-              profile: $("#test-profile").value || null, duration: 8 },
+              profile: null, duration: 8 },
     });
     out.innerHTML = renderTestResult(r);
   } catch (err) {
@@ -542,9 +542,6 @@ function openChannelModal(channel) {
   $("#c-enabled").checked = channel?.enabled ?? true;
   profileOptions($("#c-profile"), {
     includeNone: true, noneLabel: "None (pass through)", value: channel?.default_profile,
-  });
-  profileOptions($("#test-profile"), {
-    includeNone: true, noneLabel: "Test without transcode", value: "",
   });
   $("#test-result").innerHTML = "";
   $("#channel-modal").hidden = false;
