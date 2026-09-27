@@ -1416,14 +1416,18 @@ class Broadcaster:
             assert proc.stderr is not None
             try:
                 while True:
-                    line = await proc.stderr.readline()
-                    if not line:
+                    chunk = await proc.stderr.read(4096)
+                    if not chunk:
                         break
-                    text = line.decode("utf-8", "replace").rstrip()
-                    if text:
-                        tail.append(text)
-                        self._log(f"[{tag}] {text}")
-                        self._note(text)
+                    # ffmpeg writes progress lines with \r not \n so they
+                    # overwrite on a terminal. readline() never returns them;
+                    # split on both delimiters so we capture everything.
+                    for line in chunk.replace(b"\r", b"\n").split(b"\n"):
+                        text = line.decode("utf-8", "replace").rstrip()
+                        if text:
+                            tail.append(text)
+                            self._log(f"[{tag}] {text}")
+                            self._note(text)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
