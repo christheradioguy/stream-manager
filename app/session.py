@@ -1180,16 +1180,27 @@ class Broadcaster:
         subscribers = list(self._subscribers)
         if not subscribers:
             return
+        # Transcoder subscribers must never block the source pipeline: if the
+        # transcoder queue is full, drop immediately so a momentary encoding
+        # slowdown cannot cascade into a full source stall via backpressure.
+        for sub in subscribers:
+            if sub.label.startswith("transcode:"):
+                portion = self._for_subscriber(sub, chunk, start)
+                if portion:
+                    self._put_counting(sub, portion)
+        client_subs = [s for s in subscribers if not s.label.startswith("transcode:")]
+        if not client_subs:
+            return
         wait = self.settings.backpressure_seconds
         if wait <= 0:
-            for sub in subscribers:
+            for sub in client_subs:
                 portion = self._for_subscriber(sub, chunk, start)
                 if portion:
                     self._put_counting(sub, portion)
             return
         deadline = asyncio.get_running_loop().time() + wait
         await asyncio.gather(
-            *(self._deliver_one(sub, chunk, start, deadline) for sub in subscribers)
+            *(self._deliver_one(sub, chunk, start, deadline) for sub in client_subs)
         )
 
     @staticmethod
