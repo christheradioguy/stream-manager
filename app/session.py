@@ -48,6 +48,20 @@ HEALTHY_RUN_SECONDS = 60.0
 # what turns a brief rotation into a visible outage.
 RECONNECT_MIN_SECONDS = 15.0
 
+# When killing a process specifically to reconnect (not a clean stop), use a
+# much shorter grace period. The old process is already broken; we just need it
+# gone. The full terminate_grace_seconds is kept for deliberate stops where a
+# clean flush matters.
+RECONNECT_TERMINATE_GRACE = 1.5
+
+# How long a flowing source may go without producing any bytes before it is
+# considered stalled and killed so the reconnect path can recover it. The
+# existing stall_timeout_seconds only fires when the read() call itself blocks,
+# which does not help when a wedged internet source sends keepalive-level
+# traffic that never delivers real content.
+# This watchdog runs on wall-clock time against the last publish() call.
+STALL_WATCHDOG_INTERVAL = 2.0
+
 TS_PACKET = 188
 TS_SYNC = 0x47
 # Give up on finding TS sync after this much data and pass bytes through raw,
@@ -912,6 +926,8 @@ class Broadcaster:
         self._idle_timer: Optional[asyncio.Task] = None
         self._helper_tasks: list[asyncio.Task] = []
         self._stopping = False
+        # Wall-clock time of the last publish() call; used by the stall watchdog.
+        self._last_data_at: float = 0.0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -973,7 +989,7 @@ class Broadcaster:
                 )
                 if failure is not None:
                     self._record_end(failure, reconnecting)
-                await self._cleanup()
+                await self._cleanup(fast=reconnecting)
 
             if reconnecting or ran_for >= HEALTHY_RUN_SECONDS:
                 # It worked for a while, so this is a fresh problem.
@@ -1062,11 +1078,11 @@ class Broadcaster:
     async def _attempt(self) -> None:
         raise NotImplementedError
 
-    async def _cleanup(self) -> None:
+    async def _cleanup(self, fast: bool = False) -> None:
         for task in self._helper_tasks:
             task.cancel()
         self._helper_tasks.clear()
-        await self._terminate(self._procs)
+        await self._terminate(self._procs, fast=fast)
         self._procs = []
 
     # -- subscribers -------------------------------------------------------
@@ -1098,6 +1114,7 @@ class Broadcaster:
             self._schedule_idle_stop()
 
     async def publish(self, chunk: bytes) -> None:
+        self._last_data_at = time.monotonic()
         """Fan one chunk out, waiting for consumers that are briefly behind.
 
         A source is often much faster than real time - an HLS input downloads its
@@ -1298,7 +1315,7 @@ class Broadcaster:
 
     # -- process helpers ---------------------------------------------------
 
-    async def _terminate(self, procs: list[asyncio.subprocess.Process]) -> None:
+    async def _terminate(self, procs: list[asyncio.subprocess.Process], fast: bool = False) -> None:
         """Take down a pipeline and everything it spawned.
 
         The group is signalled even when the direct child has already exited by
@@ -1307,8 +1324,12 @@ class Broadcaster:
         their parent while still holding the upstream connection open. Reopening
         the source then makes a *second* connection to a provider that only
         expects one, which it answers with a reset.
+
+        When ``fast`` is True (reconnect path), a short fixed grace is used
+        instead of terminate_grace_seconds. The process is already broken and
+        we just need it gone quickly so the reconnect can start.
         """
-        grace = self.settings.terminate_grace_seconds
+        grace = RECONNECT_TERMINATE_GRACE if fast else self.settings.terminate_grace_seconds
         for proc in procs:
             self._signal_group(proc, signal.SIGTERM)
 
@@ -1774,6 +1795,41 @@ class SourceSession(Broadcaster):
         assert proc.stdout is not None
 
         aligner = TSAligner()
+
+        # Stall watchdog: kill the process if it stops delivering real data
+        # while nominally running. The read() timeout in the loop below only
+        # fires when the read itself blocks; a wedged internet source that
+        # trickles keepalive-level traffic without producing usable content
+        # would never trigger it. This watchdog checks wall-clock time since
+        # the last publish() call instead, which catches that case.
+        stall_timeout = self.settings.stall_timeout_seconds
+
+        async def _stall_watchdog() -> None:
+            # Wait for the source to start flowing before arming the watchdog,
+            # so startup latency (authentication, playlist fetch) does not
+            # count against the stall budget.
+            while not self.flowing_since and not self._stopping:
+                await asyncio.sleep(STALL_WATCHDOG_INTERVAL)
+            while not self._stopping:
+                await asyncio.sleep(STALL_WATCHDOG_INTERVAL)
+                if not self.flowing_since:
+                    continue
+                since = time.monotonic() - self._last_data_at
+                if since >= stall_timeout:
+                    self._log(
+                        f"--- stall watchdog: no data for {since:.0f}s, killing source ---"
+                    )
+                    log.warning(
+                        "session %s stalled for %.0fs, killing pid %s",
+                        self.key, since, proc.pid,
+                    )
+                    self._signal_group(proc, signal.SIGKILL)
+                    return
+
+        self._helper_tasks.append(
+            asyncio.create_task(_stall_watchdog(), name=f"watchdog:{self.key}")
+        )
+
         while True:
             timeout = (
                 self.settings.stall_timeout_seconds

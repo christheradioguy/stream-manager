@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import (
     FileResponse,
     JSONResponse,
@@ -138,6 +138,20 @@ async def require_admin(request: Request) -> None:
         raise HTTPException(status_code=401, detail="invalid or missing token")
 
 
+async def _stop_channel_after_edit(channel_id: str) -> None:
+    try:
+        await manager.stop_channel(channel_id, "channel edited")
+    except Exception:  # noqa: BLE001 - surfaced in logs without breaking the save
+        log.exception("failed to restart channel %s after edit", channel_id)
+
+
+async def _stop_profile_after_edit(profile_id: str) -> None:
+    try:
+        await manager.stop_profile(profile_id, "profile edited")
+    except Exception:  # noqa: BLE001 - surfaced in logs without breaking the save
+        log.exception("failed to restart profile %s after edit", profile_id)
+
+
 async def require_stream_access(request: Request) -> None:
     if not AUTH_TOKEN or not PROTECT_STREAMS:
         return
@@ -246,7 +260,9 @@ async def create_channel(channel: Channel) -> dict:
 
 
 @app.put("/api/channels/{channel_id}", dependencies=admin)
-async def update_channel(channel_id: str, channel: Channel) -> dict:
+async def update_channel(
+    channel_id: str, channel: Channel, background_tasks: BackgroundTasks
+) -> dict:
     if channel.default_profile and not store.profile(channel.default_profile):
         raise HTTPException(status_code=400, detail=f"no profile {channel.default_profile!r}")
     try:
@@ -254,8 +270,9 @@ async def update_channel(channel_id: str, channel: Channel) -> dict:
     except KeyError as exc:
         code = 409 if "already exists" in str(exc) else 404
         raise HTTPException(status_code=code, detail=str(exc)) from exc
-    # Existing viewers keep the old command until they reconnect otherwise.
-    await manager.stop_channel(channel_id, "channel edited")
+    # Persist first, then restart any live session in the background so the GUI
+    # is not held open waiting for a stubborn source process to exit.
+    background_tasks.add_task(_stop_channel_after_edit, channel_id)
     return channel.model_dump()
 
 
@@ -337,13 +354,15 @@ async def create_profile(profile: Profile) -> dict:
 
 
 @app.put("/api/profiles/{profile_id}", dependencies=admin)
-async def update_profile(profile_id: str, profile: Profile) -> dict:
+async def update_profile(
+    profile_id: str, profile: Profile, background_tasks: BackgroundTasks
+) -> dict:
     try:
         await store.update_profile(profile_id, profile)
     except KeyError as exc:
         code = 409 if "already exists" in str(exc) else 404
         raise HTTPException(status_code=code, detail=str(exc)) from exc
-    await manager.stop_profile(profile_id, "profile edited")
+    background_tasks.add_task(_stop_profile_after_edit, profile_id)
     return profile.model_dump()
 
 
@@ -726,7 +745,6 @@ async def stream(
         headers={
             "Cache-Control": "no-cache, no-store",
             "Pragma": "no-cache",
-            "Connection": "close",
             "Access-Control-Allow-Origin": "*",
         },
     )
