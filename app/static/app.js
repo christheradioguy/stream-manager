@@ -1259,6 +1259,8 @@ function fillSettings() {
   $("#s-loglevel").value = s.ffmpeg_loglevel;
   $("#s-loglines").value = s.log_lines;
   $("#s-baseurl").value = s.public_base_url;
+  $("#s-recorddir").value = s.record_dir;
+  $("#s-recordname").value = s.record_filename;
   $("#s-autorestart").checked = s.auto_restart;
   $("#s-epgpast").value = s.epg_past_hours;
   $("#s-epgfuture").value = s.epg_future_days;
@@ -1290,6 +1292,8 @@ $("#settings-form").addEventListener("submit", async (ev) => {
     ffmpeg_loglevel: $("#s-loglevel").value,
     log_lines: Number($("#s-loglines").value),
     public_base_url: $("#s-baseurl").value.trim(),
+    record_dir: $("#s-recorddir").value.trim(),
+    record_filename: $("#s-recordname").value.trim(),
     auto_restart: $("#s-autorestart").checked,
     epg_past_hours: Number($("#s-epgpast").value),
     epg_future_days: Number($("#s-epgfuture").value),

@@ -268,6 +268,40 @@ def run_background_restart_checks() -> None:
     asyncio.run(check_profile_update())
 
 
+def run_recorder_checks() -> None:
+    """Recording file names: template rendering, safety, and no overwriting."""
+    sys.path.insert(0, str(ROOT))
+    from app.models import Channel, Profile
+    from app.recorder import build_path, safe_name
+
+    print("\nRecording file names")
+    check("channel names are made filesystem-safe",
+          safe_name(" BBC One / HD: 2 ") == "BBC_One_HD_2", safe_name(" BBC One / HD: 2 "))
+    check("an empty name still yields something", safe_name("///") == "channel")
+
+    with tempfile.TemporaryDirectory(prefix="sm-rec-") as tmp:
+        channel = Channel(id="bbc1", name="BBC One", sources=[{"id": "s", "command": "true"}])
+        start = 1_700_000_000.0  # fixed, so the rendered name is predictable
+        path = build_path(channel, None, tmp, "{channel}-{start}.{ext}", start)
+        expected = f"bbc1-{time.strftime('%Y%m%d-%H%M%S', time.localtime(start))}.ts"
+        check("default template renders id, start time and .ts", path.name == expected, path.name)
+        check("path lands in the requested directory", path.parent == Path(tmp), str(path.parent))
+
+        path.write_bytes(b"x")
+        again = build_path(channel, None, tmp, "{channel}-{start}.{ext}", start)
+        check("an existing file is not overwritten", again.name == expected.replace(".ts", "-1.ts"),
+              again.name)
+        again.write_bytes(b"x")
+        third = build_path(channel, None, tmp, "{channel}-{start}.{ext}", start)
+        check("suffix keeps counting", third.name == expected.replace(".ts", "-2.ts"), third.name)
+
+        mkv = Profile(id="hq", name="HQ", container="matroska")
+        path = build_path(channel, mkv, tmp, "{name}-{profile}.{ext}", start)
+        check("profile container picks the extension", path.name == "BBC_One-hq.mkv", path.name)
+        path = build_path(channel, None, "~", "{name}.{ext}", start)
+        check("~ is expanded", path.parent == Path.home(), str(path.parent))
+
+
 def ts_continuity_errors(data: bytes) -> int:
     """Continuity errors in a captured stream, via the server's own analyser."""
     sys.path.insert(0, str(ROOT))
@@ -833,6 +867,7 @@ def main() -> int:
     check_log_classifier()
     check_audio_clock()
     run_background_restart_checks()
+    run_recorder_checks()
 
     port = free_port()
     base = f"http://127.0.0.1:{port}"
@@ -1070,6 +1105,109 @@ def main() -> int:
 
         status, log = api.request("GET", f"/api/sessions/{running[0]['key']}/log") if running else (0, {})
         check("session log available", status == 200 and len(log.get("lines", [])) > 0)
+
+        # ---- recording ----------------------------------------------------
+        print("\nRecording")
+        rec_dir = tmpdir / "rec"
+        status, settings_now = api.request("GET", "/api/settings")
+        status, _ = api.request("PUT", "/api/settings", {**settings_now, "record_dir": str(rec_dir)})
+        check("record_dir is a setting", status == 200)
+        status, _ = api.request("PUT", "/api/settings",
+                                {**settings_now, "record_filename": "../{channel}.ts"})
+        check("file name template with a path is rejected", status == 422)
+        status, _ = api.request("PUT", "/api/settings",
+                                {**settings_now, "record_filename": "{nope}.ts"})
+        check("unknown template placeholder is rejected", status == 422)
+
+        status, rec = api.request("POST", "/api/channels/testcard/record")
+        check("POST /api/channels/{id}/record", status == 201 and rec.get("status") == "recording",
+              str(rec)[:120])
+        check("recording goes to the configured directory",
+              str(rec.get("path", "")).startswith(str(rec_dir)), str(rec.get("path")))
+        check("recording attaches to the existing session", rec.get("session_key") == "testcard")
+        status, _ = api.request("POST", "/api/channels/testcard/record")
+        check("a second recording of the same channel is refused", status == 409)
+        status, _ = api.request("POST", "/api/channels/nosuch/record")
+        check("recording an unknown channel is 404", status == 404)
+        status, _ = api.request("POST", "/api/channels/testcard/record", {"profile": "nope"})
+        check("unknown profile is rejected", status == 400)
+        status, _ = api.request("POST", "/api/channels/testcard/record", {"filename": "a/b.ts"})
+        check("per-request file name with a path is rejected", status == 422)
+
+        time.sleep(3)
+        status, live = api.request("GET", "/api/channels/testcard/record")
+        check("GET /api/channels/{id}/record reports progress",
+              status == 200 and live.get("bytes_written", 0) > 0, f"{live.get('bytes_written')} bytes")
+        status, listing = api.request("GET", "/api/recordings")
+        check("GET /api/recordings lists it",
+              any(r["channel_id"] == "testcard" for r in listing.get("active", [])))
+        status, st = api.request("GET", "/api/state")
+        check("/api/state carries recordings", len(st.get("recordings", [])) == 1)
+        status, sessions = api.request("GET", "/api/sessions")
+        tc = next((x for x in sessions if x["key"] == "testcard"), None)
+        check("a recording is not counted as a viewer", tc is not None and tc["clients"] == 0,
+              f"clients={tc['clients'] if tc else '-'}")
+        check("but it does keep the session alive", tc is not None and tc["consumers"] >= 1,
+              f"consumers={tc['consumers'] if tc else '-'}")
+
+        status, done = api.request("POST", "/api/channels/testcard/record/stop")
+        check("POST /api/channels/{id}/record/stop", status == 200 and done.get("status") == "stopped",
+              str(done)[:120])
+        rec_path = Path(done.get("path", "/nonexistent"))
+        data = rec_path.read_bytes() if rec_path.exists() else b""
+        check("the file holds what was reported",
+              len(data) > 0 and len(data) == done.get("bytes_written"),
+              f"{len(data)} bytes on disk, {done.get('bytes_written')} reported")
+        check("recording is valid MPEG-TS", is_mpegts(data))
+        check("recording is packet-aligned", is_aligned(data), f"sync offset={sync_offset(data)}")
+        check("recording starts at a PAT", starts_at_pat(data))
+        check("recording's first video packet is a keyframe", starts_on_keyframe(data),
+              f"video pid={busiest_pid(data)}")
+        check("file name follows the template",
+              re.fullmatch(r"testcard-\d{8}-\d{6}\.ts", rec_path.name) is not None, rec_path.name)
+        check("recording did not drop data", done.get("dropped_chunks") == 0,
+              f"dropped={done.get('dropped_chunks')}")
+
+        status, _ = api.request("POST", "/api/channels/testcard/record/stop")
+        check("stopping a stopped recording is 404", status == 404)
+        status, listing = api.request("GET", "/api/recordings")
+        check("a finished recording is listed under recent",
+              any(r["path"] == str(rec_path) for r in listing.get("recent", []))
+              and not listing.get("active"))
+
+        # Per-request overrides, and the time limit.
+        other = tmpdir / "rec-other"
+        status, rec = api.request("POST", "/api/channels/testcard/record",
+                                  {"directory": str(other), "filename": "{name}-{profile}.{ext}",
+                                   "max_seconds": 3})
+        check("directory and file name overrides apply",
+              status == 201 and rec.get("path") == str(other / "Test_Card-source.ts"), str(rec.get("path")))
+        final = {}
+        for _ in range(30):
+            status, final = api.request("GET", "/api/channels/testcard/record")
+            if final.get("status") != "recording":
+                break
+            time.sleep(0.5)
+        check("max_seconds stops the recording by itself",
+              final.get("status") == "stopped" and "limit" in final.get("end_reason", ""),
+              f"status={final.get('status')} end={final.get('end_reason')!r}")
+        check("timed recording ran for about its limit",
+              2.5 <= final.get("elapsed_seconds", 0) <= 8, f"{final.get('elapsed_seconds')}s")
+
+        # An unwritable destination fails the request, not a background task.
+        status, bad = api.request("POST", "/api/channels/testcard/record",
+                                  {"directory": "/proc/nowhere"})
+        check("unwritable directory is rejected", status == 400, str(bad)[:80])
+
+        # The session going away ends the recording rather than hanging it.
+        status, rec = api.request("POST", "/api/channels/testcard/record")
+        time.sleep(1)
+        api.request("POST", "/api/sessions/testcard/stop")
+        time.sleep(0.5)
+        status, final = api.request("GET", "/api/channels/testcard/record")
+        check("stopping the session ends the recording", final.get("status") == "stopped",
+              f"status={final.get('status')} end={final.get('end_reason')!r}")
+        api.request("PUT", "/api/settings", settings_now)
 
         # ---- fan-out -----------------------------------------------------
         print("\nFan-out (shared upstream)")

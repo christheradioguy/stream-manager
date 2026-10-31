@@ -379,6 +379,21 @@
               <div class="hint">0 = serve everything the sources provide.</div>
             </div>
           </div>
+          <div class="grid">
+            <div class="field">
+              <label for="s-recorddir">Recording directory</label>
+              <input type="text" id="s-recorddir" name="record_dir" placeholder="~/recordings">
+              <div class="hint">Where <code>POST /api/channels/{id}/record</code> writes. Created on
+                first use; a request can name a different directory.</div>
+            </div>
+            <div class="field">
+              <label for="s-recordname">Recording file name</label>
+              <input type="text" id="s-recordname" name="record_filename" placeholder="{channel}-{start}.{ext}">
+              <div class="hint">Placeholders: <code>{channel}</code> <code>{name}</code>
+                <code>{profile}</code> <code>{start}</code> <code>{ext}</code>. Existing files are
+                never overwritten.</div>
+            </div>
+          </div>
           <div class="field">
             <label for="s-baseurl">Public base URL</label>
             <input type="text" id="s-baseurl" name="public_base_url" placeholder="http://tv.lan:8000">

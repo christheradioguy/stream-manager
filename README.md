@@ -446,6 +446,8 @@ lag badly.
 | **Give up after N failures** | Stop retrying a source that keeps failing. 0 keeps trying forever. A transcode profile that dies without ever emitting a frame is treated as broken and abandoned after three tries regardless. |
 | **Terminate grace** | How long a process gets to exit on SIGTERM before it is killed. Raise it if you see `ignored SIGTERM, killing` in the log. |
 | **Default max clients** | Viewer cap per channel, counted across all profiles. 0 = unlimited. |
+| **Recording directory** | Where `POST /api/channels/{id}/record` writes. Created on first use. See [Recording](#recording). |
+| **Recording file name** | Template for new recording files. Placeholders: `{channel}`, `{name}`, `{profile}`, `{start}`, `{ext}`. |
 
 ## When a provider's timestamps are broken
 
@@ -583,6 +585,52 @@ tools/tsclock.py direct.ts via-manager.ts     # compare against the source
 
 Capture from the source on its own as well and compare the two. The source is
 the reference; anything this server adds is its own fault.
+
+## Recording
+
+Any channel can be written to disk through the API while it streams, or
+without anyone watching at all. A recording attaches to the channel's live
+session the same way a viewer does, so it shares the one upstream connection,
+starts on a keyframe, and keeps the source running until it is stopped.
+
+```sh
+# Start recording the raw source to <record_dir>/<record_filename>
+curl -X POST http://127.0.0.1:8409/api/channels/bbc1/record
+
+# Record a transcoded copy, somewhere specific, for an hour at most
+curl -X POST http://127.0.0.1:8409/api/channels/bbc1/record \
+  -H 'content-type: application/json' \
+  -d '{"profile": "720p", "directory": "/srv/tv/bbc1", "max_seconds": 3600}'
+
+# Stop it
+curl -X POST http://127.0.0.1:8409/api/channels/bbc1/record/stop
+```
+
+Every field in the start body is optional:
+
+| Field | Meaning |
+|---|---|
+| `profile` | Record the output of a transcode profile instead of the raw source. |
+| `directory` | Write here instead of the **Recording directory** setting. |
+| `filename` | Name template for this recording instead of the **Recording file name** setting. |
+| `max_seconds` | Stop by itself after this long. |
+
+Where the file goes is a setting, editable in the GUI or via
+`PUT /api/settings`: `record_dir` (default `~/recordings`, created on first
+use) and `record_filename` (default `{channel}-{start}.{ext}`). The name
+template understands `{channel}` (the id), `{name}` (the channel name made
+filesystem-safe), `{profile}` (profile id, or `source` for passthrough),
+`{start}` (local start time as `YYYYMMDD-HHMMSS`) and `{ext}` (`ts` for a
+source or MPEG-TS profile, otherwise taken from the profile's container). An
+existing file is never overwritten; a numeric suffix is added instead.
+
+One recording per channel at a time; a second start returns 409. Stopping the
+channel's session, editing the channel, or the source giving up all end the
+recording cleanly, with the reason in its `end_reason`. A recording that
+cannot keep up with the stream drops data like a slow viewer would, and
+reports it in `dropped_chunks`. The state of running recordings is in
+`/api/state` and `/api/recordings`; finished ones stay listed under `recent`
+until the server restarts.
 
 ## Auditing every source
 
@@ -744,6 +792,10 @@ GET    /api/settings                    PUT to update
 GET    /api/sessions                    live session state
 POST   /api/sessions/{key}/stop
 GET    /api/sessions/{key}/log          stderr tail
+GET    /api/recordings                  recordings in progress and recently finished
+POST   /api/channels/{id}/record        start recording; body optional, see below
+POST   /api/channels/{id}/record/stop   stop it
+GET    /api/channels/{id}/record        state of the current (or last) recording
 ```
 
 Interactive docs at `/docs`.
