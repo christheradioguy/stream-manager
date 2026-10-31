@@ -409,6 +409,17 @@ class Settings(BaseModel):
     # 0 = unlimited.
     default_max_clients: int = Field(default=0, ge=0, le=1000)
 
+    # Where recordings started through the API are written. Created on first
+    # use; ~ is expanded. A request may name a different directory per recording.
+    record_dir: str = "~/recordings"
+
+    # Filename for a new recording. Placeholders: {channel} (id), {name} (the
+    # channel name, filesystem-safe), {profile} (profile id, or "source" for
+    # passthrough), {start} (local time, YYYYMMDD-HHMMSS) and {ext} (from the
+    # output container). A file that already exists is never overwritten; a
+    # numeric suffix is added instead.
+    record_filename: str = "{channel}-{start}.{ext}"
+
     # Base URL used when generating playlist entries. Empty = derive from request.
     public_base_url: str = ""
 
@@ -444,6 +455,19 @@ class Settings(BaseModel):
     def _strip_slash(cls, v: str) -> str:
         return v.strip().rstrip("/")
 
+    @field_validator("record_dir")
+    @classmethod
+    def _check_record_dir(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be empty")
+        return v
+
+    @field_validator("record_filename")
+    @classmethod
+    def _check_record_filename(cls, v: str) -> str:
+        return validate_filename_template(v)
+
 
 class Config(BaseModel):
     """The whole persisted configuration."""
@@ -474,6 +498,84 @@ class EpgMappingRequest(BaseModel):
 
     mapping: dict[str, Optional[str]] = Field(default_factory=dict)
     auto: list[str] = Field(default_factory=list)
+
+
+RECORD_TEMPLATE_FIELDS = {
+    "channel": "x",
+    "name": "x",
+    "profile": "x",
+    "start": "x",
+    "ext": "x",
+}
+
+
+def validate_filename_template(value: str) -> str:
+    """A filename template must stay inside its directory and only use known keys."""
+    value = value.strip()
+    if not value:
+        raise ValueError("must not be empty")
+    if "/" in value or "\\" in value or value in (".", ".."):
+        raise ValueError("must be a file name, not a path")
+    try:
+        rendered = value.format(**RECORD_TEMPLATE_FIELDS)
+    except KeyError as exc:
+        raise ValueError(
+            f"unknown placeholder {exc.args[0]!r}; use "
+            + ", ".join("{%s}" % k for k in RECORD_TEMPLATE_FIELDS)
+        ) from exc
+    except (ValueError, IndexError) as exc:
+        raise ValueError(f"bad template: {exc}") from exc
+    if not rendered or rendered in (".", ".."):
+        raise ValueError("renders to an empty name")
+    return value
+
+
+class RecordRequest(BaseModel):
+    """Body of POST /api/channels/{id}/record. Every field is optional."""
+
+    # Record the output of this transcode profile instead of the raw source.
+    profile: Optional[str] = None
+    # Override Settings.record_dir for this one recording.
+    directory: Optional[str] = None
+    # Override Settings.record_filename for this one recording. Same placeholders.
+    filename: Optional[str] = None
+    # Stop automatically after this long. None = until told to stop.
+    max_seconds: Optional[float] = Field(default=None, ge=1, le=7 * 24 * 3600)
+
+    @field_validator("directory")
+    @classmethod
+    def _check_directory(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
+
+    @field_validator("filename")
+    @classmethod
+    def _check_filename(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        return validate_filename_template(v) if v else None
+
+
+class RecordingState(BaseModel):
+    channel_id: str
+    channel_name: str
+    profile: Optional[str]
+    # Which live session the recording is attached to.
+    session_key: str
+    path: str
+    status: Literal["recording", "stopped", "error"]
+    started_at: Optional[float]
+    elapsed_seconds: float
+    bytes_written: int
+    # 64 KB chunks lost because the disk could not keep up.
+    dropped_chunks: int
+    max_seconds: Optional[float] = None
+    # Why it ended, once it has.
+    end_reason: str = ""
+    error: str = ""
 
 
 class TestRequest(BaseModel):

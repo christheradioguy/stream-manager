@@ -31,11 +31,13 @@ from .models import (
     EpgSource,
     Network,
     Profile,
+    RecordRequest,
     ReorderRequest,
     Settings,
     TestRequest,
 )
 from .playlist import build_playlist
+from .recorder import AlreadyRecording, Recorder
 from .session import NoCapacity, TooManyClients
 from .store import ConfigStore
 
@@ -61,6 +63,7 @@ store = ConfigStore(CONFIG_PATH)
 manager = SessionManager(get_network=lambda nid: store.network(nid))
 epg = EpgStore(CONFIG_PATH.parent / "epg")
 auditor = Auditor(manager.registry)
+recorder = Recorder(manager)
 
 EPG_TICK_SECONDS = 300
 
@@ -113,6 +116,8 @@ async def lifespan(app: FastAPI):
         await scheduler
     if auditor.running:
         await auditor.cancel()
+    # Recordings first, so their files are flushed before the sessions go.
+    await recorder.shutdown()
     await manager.shutdown()
 
 
@@ -212,6 +217,7 @@ async def get_state(request: Request) -> dict:
         "profiles": [p.model_dump() for p in store.profiles],
         "networks": _network_usage(),
         "sessions": [s.state().model_dump() for s in manager.all()],
+        "recordings": [r.state().model_dump() for r in recorder.active()],
         "base_url": store.settings.public_base_url or _base_url(request),
         "protect_streams": bool(AUTH_TOKEN and PROTECT_STREAMS),
         "config_path": str(CONFIG_PATH),
@@ -282,6 +288,7 @@ async def delete_channel(channel_id: str) -> dict:
         await store.delete_channel(channel_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    await recorder.stop(channel_id, "channel deleted")
     await manager.stop_channel(channel_id, "channel deleted")
     return {"deleted": channel_id}
 
@@ -332,6 +339,80 @@ async def test_ad_hoc(body: TestRequest) -> dict:
     return await test_source(
         body.command, bool(body.use_shell), profile, store.settings, body.duration
     )
+
+
+# ---------------------------------------------------------------------------
+# Recording
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/recordings", dependencies=admin)
+async def list_recordings() -> dict:
+    """Recordings in progress, plus the most recently finished ones."""
+    return {
+        "active": [r.state().model_dump() for r in recorder.active()],
+        "recent": [r.state().model_dump() for r in recorder.recent()],
+    }
+
+
+@app.get("/api/channels/{channel_id}/record", dependencies=admin)
+async def get_recording(channel_id: str) -> dict:
+    """The current recording of a channel, or the last one if none is running."""
+    recording = recorder.get(channel_id)
+    if recording is None:
+        if store.channel(channel_id) is None:
+            raise HTTPException(status_code=404, detail=f"no channel {channel_id!r}")
+        raise HTTPException(status_code=404, detail=f"channel {channel_id!r} has not been recorded")
+    return recording.state().model_dump()
+
+
+@app.post("/api/channels/{channel_id}/record", dependencies=admin, status_code=201)
+async def start_recording(channel_id: str, body: Optional[RecordRequest] = None) -> dict:
+    """Start writing a channel to disk.
+
+    The recording attaches to the channel's live session like any other viewer,
+    so it never opens a second upstream connection and keeps the source running
+    until it is stopped. The destination comes from the `record_dir` and
+    `record_filename` settings unless the body overrides them.
+    """
+    body = body or RecordRequest()
+    channel = store.channel(channel_id)
+    if channel is None:
+        raise HTTPException(status_code=404, detail=f"no channel {channel_id!r}")
+    if not channel.enabled:
+        raise HTTPException(status_code=503, detail=f"channel {channel_id!r} is disabled")
+
+    profile = None
+    if body.profile:
+        profile = store.profile(body.profile)
+        if profile is None:
+            raise HTTPException(status_code=400, detail=f"no profile {body.profile!r}")
+
+    try:
+        recording = await recorder.start(
+            channel,
+            profile,
+            store.settings,
+            directory=body.directory,
+            filename=body.filename,
+            max_seconds=body.max_seconds,
+        )
+    except AlreadyRecording as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except NoCapacity as exc:
+        log.info("refused recording of %s: %s", channel_id, exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"cannot write recording: {exc}") from exc
+    return recording.state().model_dump()
+
+
+@app.post("/api/channels/{channel_id}/record/stop", dependencies=admin)
+async def stop_recording(channel_id: str) -> dict:
+    recording = await recorder.stop(channel_id)
+    if recording is None:
+        raise HTTPException(status_code=404, detail=f"channel {channel_id!r} is not recording")
+    return recording.state().model_dump()
 
 
 # ---------------------------------------------------------------------------
@@ -772,5 +853,6 @@ async def healthz() -> JSONResponse:
             "channels": len(store.channels),
             "sessions": len(manager.all()),
             "clients": sum(s.client_count for s in manager.all()),
+            "recordings": len(recorder.active()),
         }
     )
