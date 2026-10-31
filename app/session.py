@@ -926,8 +926,12 @@ class Broadcaster:
         self._idle_timer: Optional[asyncio.Task] = None
         self._helper_tasks: list[asyncio.Task] = []
         self._stopping = False
-        # Wall-clock time of the last publish() call; used by the stall watchdog.
+        # Monotonic time the source last handed us data, or last finished
+        # waiting on consumers; used by the stall watchdog.
         self._last_data_at: float = 0.0
+        # True while publish() is held up by backpressure. The pipe is not being
+        # read then on purpose, so the source is not stalled.
+        self._delivering = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -1114,7 +1118,6 @@ class Broadcaster:
             self._schedule_idle_stop()
 
     async def publish(self, chunk: bytes) -> None:
-        self._last_data_at = time.monotonic()
         """Fan one chunk out, waiting for consumers that are briefly behind.
 
         A source is often much faster than real time - an HLS input downloads its
@@ -1127,6 +1130,7 @@ class Broadcaster:
         The wait is bounded: a consumer still full at the deadline is genuinely
         too slow, and its oldest data is dropped so it cannot stall everyone else.
         """
+        self._last_data_at = time.monotonic()
         if self._ts_output and self._audio_clock is not None:
             # Before the restamper, and before anything else: this repairs what
             # the provider sent, the restamper then places it on our timeline.
@@ -1159,7 +1163,14 @@ class Broadcaster:
         if self._ts_output:
             pats, raps = self._start_points.scan(chunk)
         self._push_prebuffer(chunk, pats, raps)
-        await self._deliver(chunk, self._clean_start(pats, raps))
+        self._delivering = True
+        try:
+            await self._deliver(chunk, self._clean_start(pats, raps))
+        finally:
+            self._delivering = False
+            # Time spent waiting on a slow consumer is not time the source was
+            # silent; start the stall clock again from here.
+            self._last_data_at = time.monotonic()
 
     @staticmethod
     def _clean_start(pats: list[int], raps: list[int]) -> Optional[int]:
@@ -1812,7 +1823,7 @@ class SourceSession(Broadcaster):
                 await asyncio.sleep(STALL_WATCHDOG_INTERVAL)
             while not self._stopping:
                 await asyncio.sleep(STALL_WATCHDOG_INTERVAL)
-                if not self.flowing_since:
+                if not self.flowing_since or self._delivering:
                     continue
                 since = time.monotonic() - self._last_data_at
                 if since >= stall_timeout:
